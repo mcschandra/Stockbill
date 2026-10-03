@@ -3,9 +3,12 @@
 StockBill - inventory and billing in a single Python file.
 
 * No database: everything lives in one JSON file (default: stockbill_data.json).
-* No dependencies: Python 3.8+ standard library only.
+* Python 3.8+; the qrcode dependency generates payment QR codes locally.
 * Desktop + mobile: it runs a small web server with a responsive UI. Open it in
   a browser on the computer, and on any phone/tablet on the same Wi-Fi.
+
+Install dependencies:
+    python -m pip install -r requirements.txt
 
 Run:
     python stockbill.py                      # starts on port 8000
@@ -16,10 +19,11 @@ Run:
 
 Features: items and stock, customers, billing with GST/tax + discounts, part payments
 and credit (dues), stock history, void bills (stock returns), print invoices,
-WhatsApp share, single-key keyboard navigation, expense register,
+WhatsApp Web reminders, monthly simple interest on credit, single-key keyboard navigation, expense register,
 cash summaries, CSV exports, JSON backup, and a persistent activity log.
 """
 import argparse
+import calendar
 import csv
 import hashlib
 import hmac
@@ -37,7 +41,10 @@ import webbrowser
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
+
+import qrcode
+from qrcode.image.svg import SvgPathImage
 
 APP_NAME = "StockBill"
 CENT = Decimal("0.01")
@@ -50,6 +57,8 @@ DEFAULT_SETTINGS = {
     "business_name": "My Shop",
     "address": "",
     "phone": "",
+    "upi_id": "",
+    "credit_interest_monthly": 0.0,
     "gstin": "",
     "currency": "\u20b9",
     "country_code": "91",
@@ -150,6 +159,19 @@ def pin_digest(pin, salt):
 
 def valid_pin(pin):
     return isinstance(pin, str) and re.fullmatch(r"\d{4,12}", pin) is not None
+
+
+def valid_upi_id(value):
+    return isinstance(value, str) and re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}@[A-Za-z][A-Za-z0-9.-]{1,62}", value
+    ) is not None
+
+
+def month_anniversary(day, months):
+    month_index = day.month - 1 + months
+    year = day.year + month_index // 12
+    month = month_index % 12 + 1
+    return day.replace(year=year, month=month, day=min(day.day, calendar.monthrange(year, month)[1]))
 
 
 # --------------------------------------------------------------------------- #
@@ -281,6 +303,16 @@ class Store:
     def update_settings(self, p):
         with self.lock:
             s = self.data["settings"]
+            interest_rate = None
+            if "credit_interest_monthly" in p:
+                interest_rate = dec(p.get("credit_interest_monthly"), "Monthly credit interest rate")
+                if not 0 <= interest_rate <= 100:
+                    raise ApiError(400, "Monthly credit interest rate must be between 0 and 100")
+            if "upi_id" in p:
+                upi_id = text(p["upi_id"], 164)
+                if upi_id and not valid_upi_id(upi_id):
+                    raise ApiError(400, "Enter a valid UPI ID, such as name@bank")
+                s["upi_id"] = upi_id
             long_fields = ("address", "footer_note")
             for key in ("business_name", "address", "phone", "gstin", "currency",
                         "country_code", "invoice_prefix", "footer_note"):
@@ -294,8 +326,37 @@ class Store:
             for key in ("round_off", "allow_negative_stock"):
                 if key in p:
                     s[key] = bool(p[key])
+            if interest_rate is not None:
+                s["credit_interest_monthly"] = float(interest_rate)
             self._commit()
             return s
+
+    def upi_qr(self, q):
+        with self.lock:
+            settings = self.data["settings"]
+            upi_id = settings.get("upi_id", "")
+            if not valid_upi_id(upi_id):
+                raise ApiError(400, "Add a valid UPI ID in Settings before generating a payment QR")
+            amount = dec(qs(q, "amount"), "Amount")
+            if amount <= 0:
+                raise ApiError(400, "QR payment amount must be more than zero")
+            if amount > Decimal("999999999999.99"):
+                raise ApiError(400, "QR payment amount is too large")
+            amount = money(amount)
+            payment_uri = "upi://pay?" + urlencode({
+                "pa": upi_id,
+                "pn": text(settings.get("business_name"), 80) or "StockBill",
+                "am": f"{amount:.2f}",
+                "cu": "INR",
+                "tn": "StockBill payment",
+            })
+            qr = qrcode.QRCode(box_size=8, border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
+            qr.add_data(payment_uri)
+            qr.make(fit=True)
+            image = qr.make_image(image_factory=SvgPathImage)
+            output = io.BytesIO()
+            image.save(output)
+            return output.getvalue()
 
     def update_pin(self, pin):
         if not valid_pin(pin):
@@ -420,15 +481,18 @@ class Store:
     # -- customers --------------------------------------------------------- #
     def list_customers(self):
         with self.lock:
-            due, bills = {}, {}
+            due, interest_due, bills = {}, {}, {}
             for inv in self.data["invoices"]:
+                self._recalc(inv)
                 cid = inv["customer_id"]
                 if cid is None:
                     continue
                 bills[cid] = bills.get(cid, 0) + 1
                 if inv["status"] != "void":
-                    due[cid] = due.get(cid, Decimal(0)) + Decimal(str(inv["balance"]))
-            return [{**c, "due": float(due.get(c["id"], 0)), "bills": bills.get(c["id"], 0)}
+                    due[cid] = due.get(cid, Decimal(0)) + Decimal(str(inv["total_due"]))
+                    interest_due[cid] = interest_due.get(cid, Decimal(0)) + Decimal(str(inv["interest_balance"]))
+            return [{**c, "due": float(due.get(c["id"], 0)),
+                     "interest_due": float(interest_due.get(c["id"], 0)), "bills": bills.get(c["id"], 0)}
                     for c in self.data["customers"]]
 
     def save_customer(self, p, cid=None):
@@ -462,14 +526,68 @@ class Store:
             return {"deleted": True}
 
     # -- invoices ---------------------------------------------------------- #
-    @staticmethod
-    def _recalc(inv):
-        paid = sum((Decimal(str(x["amount"])) for x in inv["payments"]), Decimal(0))
+    def _recalc(self, inv):
         grand = Decimal(str(inv["grand_total"]))
+        payments = inv.get("payments", [])
+        principal_paid = sum(
+            (Decimal(str(payment.get("principal_amount", payment["amount"]))) for payment in payments),
+            Decimal(0),
+        )
+        interest_paid = sum(
+            (Decimal(str(payment.get("interest_amount", 0))) for payment in payments),
+            Decimal(0),
+        )
+        paid = sum((Decimal(str(payment["amount"])) for payment in payments), Decimal(0))
+        principal_balance = max(Decimal(0), money(grand - principal_paid))
+        interest_accrued = self._interest_accrued(inv)
+        interest_balance = max(Decimal(0), money(interest_accrued - interest_paid))
         inv["paid"] = float(money(paid))
-        inv["balance"] = float(money(grand - paid))
+        inv["principal_balance"] = float(principal_balance)
+        inv["interest_accrued"] = float(interest_accrued)
+        inv["interest_paid"] = float(money(interest_paid))
+        inv["interest_balance"] = float(interest_balance)
+        inv["balance"] = float(principal_balance)
+        inv["total_due"] = float(money(principal_balance + interest_balance))
         if inv["status"] != "void":
-            inv["status"] = status_for(grand, paid)
+            inv["status"] = status_for(grand + interest_accrued, paid)
+
+    def _interest_accrued(self, inv, as_of=None):
+        rate = Decimal(str(self.data["settings"].get("credit_interest_monthly", 0)))
+        if rate <= 0 or not inv.get("customer_id") or inv.get("status") == "void":
+            return Decimal(0)
+        issue_date = datetime.strptime(inv["date"][:10], "%Y-%m-%d").date()
+        today = as_of or datetime.now().date()
+        if issue_date >= today:
+            return Decimal(0)
+        payments = sorted(
+            inv.get("payments", []),
+            key=lambda payment: payment.get("date", "")[:10],
+        )
+
+        def principal_amount(payment):
+            return Decimal(str(payment.get("principal_amount", payment["amount"])))
+
+        principal = Decimal(str(inv["grand_total"]))
+        for payment in payments:
+            payment_day = datetime.strptime(payment.get("date", "")[:10], "%Y-%m-%d").date()
+            if payment_day <= issue_date:
+                principal = max(Decimal(0), principal - principal_amount(payment))
+
+        accrued = Decimal(0)
+        period_start = issue_date
+        month = 1
+        while principal > 0:
+            period_end = month_anniversary(issue_date, month)
+            if period_end > today:
+                break
+            accrued += money(principal * rate / 100)
+            for payment in payments:
+                payment_day = datetime.strptime(payment.get("date", "")[:10], "%Y-%m-%d").date()
+                if period_start < payment_day <= period_end:
+                    principal = max(Decimal(0), principal - principal_amount(payment))
+            period_start = period_end
+            month += 1
+        return money(accrued)
 
     def create_invoice(self, p):
         with self.lock:
@@ -570,7 +688,9 @@ class Store:
 
     def get_invoice(self, iid):
         with self.lock:
-            return self._find("invoices", iid, "Invoice")
+            inv = self._find("invoices", iid, "Invoice")
+            self._recalc(inv)
+            return inv
 
     def list_invoices(self, q):
         with self.lock:
@@ -581,6 +701,7 @@ class Store:
             limit = min(to_int(qs(q, "limit", "300"), "Limit"), 2000)
             rows = []
             for inv in reversed(self.data["invoices"]):
+                self._recalc(inv)
                 if not date_in_financial_year(inv["date"], year):
                     continue
                 if status == "due":
@@ -617,15 +738,22 @@ class Store:
     def add_payment(self, iid, p):
         with self.lock:
             inv = self._find("invoices", iid, "Invoice")
+            self._recalc(inv)
             if inv["status"] == "void":
                 raise ApiError(409, "This bill is void")
             amount = money(dec(p.get("amount"), "Amount"))
             if amount <= 0:
                 raise ApiError(400, "Amount must be more than zero")
-            if amount > Decimal(str(inv["balance"])):
-                raise ApiError(400, f"Amount is more than the balance of {inv['balance']:.2f}")
+            if amount > Decimal(str(inv["total_due"])):
+                raise ApiError(400, f"Amount is more than the total due of {inv['total_due']:.2f}")
             method = p.get("method") if p.get("method") in PAY_METHODS else "Cash"
-            inv["payments"].append({"date": now(), "amount": float(amount), "method": method})
+            principal_amount = min(amount, Decimal(str(inv["principal_balance"])))
+            interest_amount = amount - principal_amount
+            inv["payments"].append({
+                "date": now(), "amount": float(amount), "method": method,
+                "principal_amount": float(principal_amount),
+                "interest_amount": float(interest_amount),
+            })
             self._recalc(inv)
             self._commit()
             return inv
@@ -665,6 +793,8 @@ class Store:
             year = financial_year_bounds(qs(q, "financial_year", "all"))
             selected = [inv for inv in self.data["invoices"]
                         if date_in_financial_year(inv["date"], year)]
+            for inv in selected:
+                self._recalc(inv)
             live = [inv for inv in selected if inv["status"] != "void"]
             expenses = [e for e in self.data["expenses"]
                         if date_in_financial_year(e["date"], year)]
@@ -678,7 +808,7 @@ class Store:
                 "year_collected": collected,
                 "year_expenses": spent,
                 "year_net_cash": round(collected - spent, 2),
-                "receivables": round(sum(inv["balance"] for inv in live), 2),
+                "receivables": round(sum(inv["total_due"] for inv in live), 2),
                 "year_tax_billed": round(sum(inv["tax_total"] for inv in live), 2),
                 "year_expense_count": len(expenses),
             }
@@ -712,6 +842,8 @@ class Store:
             year = financial_year_bounds(qs(q, "financial_year", "all"))
             selected = [i for i in self.data["invoices"]
                         if date_in_financial_year(i["date"], year)]
+            for inv in selected:
+                self._recalc(inv)
             live = [i for i in selected if i["status"] != "void"]
 
             def total(rows):
@@ -742,7 +874,7 @@ class Store:
                 "month_sales": total([i for i in live if i["date"].startswith(month)]),
                 "year_sales": total(live),
                 "year_count": len(live),
-                "outstanding": round(sum(i["balance"] for i in live), 2),
+                "outstanding": round(sum(i["total_due"] for i in live), 2),
                 "stock_cost": round(sum(p["stock"] * p["cost"] for p in active), 2),
                 "stock_retail": round(sum(p["stock"] * p["price"] for p in active), 2),
                 "item_count": len(active),
@@ -761,14 +893,17 @@ class Store:
             out = io.StringIO()
             w = csv.writer(out)
             w.writerow(["Invoice", "Date", "Customer", "Phone", "Subtotal", "Discount", "Tax",
-                        "Round off", "Total", "Paid", "Balance", "Status"])
+                        "Round off", "Total", "Interest accrued", "Interest paid",
+                        "Interest balance", "Paid", "Balance", "Total due", "Status"])
             for i in self.data["invoices"]:
                 if not date_in_financial_year(i["date"], year):
                     continue
+                self._recalc(i)
                 w.writerow([i["number"], i["date"], csv_safe(i["customer"]["name"]),
                             csv_safe(i["customer"]["phone"]), i["subtotal"], i["discount_total"],
-                            i["tax_total"], i["round_off"], i["grand_total"], i["paid"],
-                            i["balance"], i["status"]])
+                            i["tax_total"], i["round_off"], i["grand_total"], i["interest_accrued"],
+                            i["interest_paid"], i["interest_balance"], i["paid"], i["balance"],
+                            i["total_due"], i["status"]])
             return out.getvalue().encode("utf-8-sig")  # BOM so Excel reads it correctly
 
     def expenses_csv(self, q=None):
@@ -860,6 +995,9 @@ def build_routes(store):
     g = lambda m: int(m.group(1))
     return [
         ("GET", r"/api/info", lambda m, q, b: store.info),
+        ("GET", r"/api/upi-qr", lambda m, q, b: Raw(
+            store.upi_qr(q), "image/svg+xml; charset=utf-8"
+        )),
         ("POST", r"/api/client-errors", lambda m, q, b: (
             store.log_activity("technical", "Browser error",
                                f"{text(b.get('message'), 500)}\n{text(b.get('stack'), 1200)}", 500)
@@ -1293,6 +1431,11 @@ button.row{cursor:pointer}button.row:hover{background:#F7FAF8}
 .expense-row{grid-template-columns:minmax(0,1fr) 170px 90px 130px}
 .expense-date{text-align:right}.expense-amount{text-align:right}
 .expense-note{grid-column:1/-1;font-size:13.5px}
+.upi-qr{display:flex;align-items:center;gap:16px;padding:14px;border:1px solid var(--line);border-radius:12px;background:#fff}
+.upi-qr img{width:148px;height:148px;flex:0 0 148px;background:#fff}
+.upi-qr img[hidden]{display:none}
+.upi-qr-copy{min-width:0}
+.upi-qr-copy p{margin-top:4px}
 .r-act{display:flex;gap:6px;justify-content:flex-end}
 .empty{padding:26px 16px;text-align:center;color:var(--muted)}
 .empty .btn{margin-top:12px}
@@ -1431,6 +1574,8 @@ dialog::backdrop{background:rgba(10,30,36,.55)}
   .two{grid-template-columns:1fr 1fr}
   .tile b{font-size:21px}
   .pos-grid{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
+  .upi-qr{align-items:flex-start;gap:10px;padding:10px}
+  .upi-qr img{width:116px;height:116px;flex-basis:116px}
 }
 @media (prefers-reduced-motion:no-preference){
   dialog[open]{animation:pop .16s ease-out}
@@ -1517,10 +1662,12 @@ const matches = (p, q) => !q || `${p.name} ${p.sku} ${p.category}`.toLowerCase()
 
 /* ---------- api ---------- */
 let sessionPin = '', loginEnabled = false, sessionActive = false;
+let upiQrUrl = '', upiQrRequest = 0;
 try { localStorage.removeItem('sb_pin'); } catch (_) {}
 function showLogin(pinRequired, message = '') {
   sessionPin = '';
   sessionActive = false;
+  clearUpiQr();
   $('#app').hidden = true;
   $('#login-screen').hidden = false;
   $('#login-pin-wrap').hidden = !pinRequired;
@@ -1578,6 +1725,62 @@ async function download(path, name) {
   a.href = URL.createObjectURL(await r.blob()); a.download = name;
   document.body.append(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+}
+function clearUpiQr() {
+  upiQrRequest++;
+  if (upiQrUrl) URL.revokeObjectURL(upiQrUrl);
+  upiQrUrl = '';
+}
+async function refreshUpiQr(amount) {
+  const image = $('#upi-qr-image'), message = $('#upi-qr-message');
+  const request = ++upiQrRequest;
+  if (upiQrUrl) URL.revokeObjectURL(upiQrUrl);
+  upiQrUrl = '';
+  if (!image || !message) return;
+  image.hidden = true;
+  image.removeAttribute('src');
+  const amountLabel = $('.upi-qr-copy b');
+  if (amountLabel) {
+    amountLabel.textContent = amount > 0
+      ? `Scan to pay ${fmtMoney(amount)}`
+      : 'Enter the part-payment amount';
+  }
+  image.alt = `UPI payment QR for ${fmtMoney(amount)}`;
+  if (!S.settings.upi_id) {
+    message.textContent = 'Add your UPI ID in Settings to generate a payment QR.';
+    return;
+  }
+  if (!(amount > 0)) {
+    message.textContent = 'Enter a part-payment amount to generate its QR.';
+    return;
+  }
+  message.textContent = 'Generating payment QR...';
+  try {
+    const headers = {};
+    if (sessionPin) headers['X-Pin'] = sessionPin;
+    const response = await fetch(`/api/upi-qr?amount=${encodeURIComponent(amount.toFixed(2))}`, {headers});
+    if (response.status === 401) {
+      showLogin(true, 'Your session expired. Sign in again.');
+      return;
+    }
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      throw new Error(result.error || 'Could not generate the payment QR.');
+    }
+    const objectUrl = URL.createObjectURL(await response.blob());
+    if (request !== upiQrRequest) {
+      URL.revokeObjectURL(objectUrl);
+      return;
+    }
+    upiQrUrl = objectUrl;
+    image.src = objectUrl;
+    image.hidden = false;
+    message.textContent = '';
+  } catch (error) {
+    if (request !== upiQrRequest) return;
+    message.textContent = `Could not generate the payment QR: ${error.message}`;
+    reportClientError(error.message, error.stack);
+  }
 }
 
 /* ---------- ui helpers ---------- */
@@ -1777,7 +1980,10 @@ async function render() {
     if (S.focusPos && S.view === 'billing') { S.focusPos = false; $('#pos-q').focus(); }
   } catch (err) { toast(err.message, 'err'); }
 }
-window.addEventListener('hashchange', () => { window.scrollTo(0, 0); render(); });
+window.addEventListener('hashchange', () => {
+  if (!location.hash.startsWith('#/billing')) clearUpiQr();
+  window.scrollTo(0, 0); render();
+});
 
 /* ================= DASHBOARD ================= */
 async function vDashboard() {
@@ -1944,12 +2150,22 @@ function renderBill() {
       <div class="chips" role="group" aria-label="Payment method">
         ${[['Cash', 'Cash'], ['UPI', 'UPI'], ['credit', 'Credit']].map(([m, t]) =>
           `<button class="chip ${m === 'credit' ? cur.mode === 'credit' : cur.mode !== 'credit' && cur.method === m ? 'on' : ''}" data-act="transaction-method" data-method="${m}">${t}</button>`).join('')}</div>
+      ${cur.method === 'UPI' && cur.mode !== 'credit' ? `<div class="upi-qr" aria-live="polite">
+        <img id="upi-qr-image" alt="UPI payment QR for ${esc(fmtMoney(cur.mode === 'part' ? num(cur.amount) : c.grand))}" hidden>
+        <div class="upi-qr-copy"><b>Scan to pay ${fmtMoney(cur.mode === 'part' ? num(cur.amount) : c.grand)}</b>
+          <p class="muted">${esc(S.settings.upi_id || 'UPI ID not set')}</p><p class="muted" id="upi-qr-message"></p></div>
+      </div>` : ''}
       ${cur.mode !== 'credit' ? `<button class="chip ${cur.mode === 'part' ? 'on' : ''}" data-act="part-payment">${cur.mode === 'part' ? 'Part payment on' : 'Record part payment'}</button>` : '<p class="muted">The full amount will be added to this customer’s pending bills.</p>'}
       ${cur.mode === 'part' ? `<label class="f"><span>Amount received by ${esc(cur.method)}</span><input inputmode="decimal" data-in="paid" value="${esc(cur.amount)}" placeholder="0.00" required></label>` : ''}
       <label class="f"><span>Note</span><input data-in="notes" maxlength="200" placeholder="Optional" value="${esc(cur.notes)}"></label>
     </div>
     <button class="btn gold lg block" id="save-btn" data-act="save-bill">Save bill for ${fmtMoney(c.grand)}</button>` : ''}
   </div>`;
+  if (S.cart.length && cur.method === 'UPI' && cur.mode !== 'credit') {
+    refreshUpiQr(cur.mode === 'part' ? num(cur.amount) : c.grand);
+  } else {
+    clearUpiQr();
+  }
   const tc = $('#tab-count'); if (tc) tc.textContent = S.cart.length || '';
 }
 function refreshTotals() {
@@ -1957,11 +2173,18 @@ function refreshTotals() {
   c.lines.forEach((v, i) => set('lt-' + i, fmtMoney(v)));
   set('t-gross', fmtMoney(c.gross)); set('t-disc', '\u2212' + fmtMoney(c.disc)); set('t-tax', fmtMoney(c.tax));
   set('t-round', fmtMoney(c.round)); set('t-grand', fmtMoney(c.grand)); set('save-btn', 'Save bill for ' + fmtMoney(c.grand));
+  if (S.pay.method === 'UPI' && S.pay.mode !== 'credit') {
+    refreshUpiQr(S.pay.mode === 'part' ? num(S.pay.amount) : c.grand);
+    const label = $('#upi-qr-image');
+    if (label) label.alt = `UPI payment QR for ${fmtMoney(S.pay.mode === 'part' ? num(S.pay.amount) : c.grand)}`;
+    const amount = $('.upi-qr-copy b');
+    if (amount) amount.textContent = `Scan to pay ${fmtMoney(S.pay.mode === 'part' ? num(S.pay.amount) : c.grand)}`;
+  }
 }
 const lineInput = key => (el, e) => { const l = S.cart[+el.dataset.i]; if (!l) return; l[key] = Math.max(0, num(el.value)); if (key === 'disc') l.disc = Math.min(100, l.disc); saveCart(); refreshTotals(); };
 inputs.qty = (el, e) => { const l = S.cart[+el.dataset.i]; if (!l) return; l.qty = Math.max(0, num(el.value)); clampQty(l); saveCart(); refreshTotals(); };
 inputs.price = lineInput('price'); inputs.disc = lineInput('disc');
-inputs.paid = el => { S.pay.amount = el.value; };
+inputs.paid = el => { S.pay.amount = el.value; refreshUpiQr(num(S.pay.amount)); };
 inputs.notes = el => { S.pay.notes = el.value; };
 changes.cust = el => { S.cartCustomer = el.value; };
 changes.method = el => { S.pay.method = el.value; };
@@ -2084,8 +2307,8 @@ function customerRows() {
   const rows = S.customers.filter(c => !q || `${c.name} ${c.phone}`.toLowerCase().includes(q));
   if (!rows.length) return `<div class="empty">${S.customers.length ? 'No customers match.' : 'No customers yet. Save regulars here to track what they owe.'}</div>`;
   return rows.map(c => `<div class="row cust"><div class="r-main"><b>${esc(c.name)}</b><span class="muted">${esc(c.phone || 'No phone')}${c.address ? ', ' + esc(c.address) : ''}</span></div>
-    <div class="num">${c.due > 0 ? `<span class="badge bad">${fmtMoney(c.due)} due</span>` : `<span class="muted">${c.bills} ${c.bills === 1 ? 'bill' : 'bills'}</span>`}</div>
-    <div class="r-act"><button class="btn ghost sm" data-act="cust-bills" data-id="${c.id}">Bills</button><button class="btn ghost sm" data-act="edit-customer" data-id="${c.id}">Edit</button></div></div>`).join('');
+    <div class="num">${c.due > 0 ? `<span class="badge bad">${fmtMoney(c.due)} due</span>${c.interest_due > 0 ? `<br><span class="muted">${fmtMoney(c.interest_due)} interest</span>` : ''}` : `<span class="muted">${c.bills} ${c.bills === 1 ? 'bill' : 'bills'}</span>`}</div>
+    <div class="r-act"><button class="btn ghost sm" data-act="cust-bills" data-id="${c.id}">Bills</button>${c.due > 0 && c.phone ? `<a class="btn ghost sm" href="${whatsappWebLink(c.phone, customerReminder(c))}" target="_blank" rel="noopener noreferrer">Remind on WhatsApp</a>` : ''}<button class="btn ghost sm" data-act="edit-customer" data-id="${c.id}">Edit</button></div></div>`).join('');
 }
 inputs.cq = el => { S.q.customers = el.value; $('#cust-list').innerHTML = customerRows(); };
 actions['new-customer'] = () => customerForm();
@@ -2129,7 +2352,7 @@ async function refreshInvoiceList() {
   S.invoices = await api('/invoices?' + p);
   el.innerHTML = S.invoices.length ? S.invoices.map(i => `<button class="row invr" data-act="open-inv" data-id="${i.id}">
     <b class="a">${esc(i.number)}</b><span class="b">${esc(i.customer.name)}</span><span class="muted c">${fmtDate(i.date)}</span>
-    <b class="num d">${fmtMoney(i.grand_total)}${i.status !== 'void' && i.balance > 0 ? `<br><span class="muted" style="font-weight:500">${fmtMoney(i.balance)} due</span>` : ''}</b><span class="e">${statusBadge(i.status)}</span></button>`).join('')
+    <b class="num d">${fmtMoney(i.grand_total)}${i.status !== 'void' && i.total_due > 0 ? `<br><span class="muted" style="font-weight:500">${fmtMoney(i.total_due)} due</span>` : ''}</b><span class="e">${statusBadge(i.status)}</span></button>`).join('')
     : '<div class="empty">No invoices found.</div>';
 }
 inputs.iq = debounce(el => { S.q.invoices = el.value; refreshInvoiceList(); });
@@ -2153,32 +2376,55 @@ function invoiceHTML(inv) {
       ${inv.round_off ? `<div><span>Round off</span><span>${fmtMoney(inv.round_off)}</span></div>` : ''}
       <div class="g"><span>Total</span><span>${fmtMoney(inv.grand_total)}</span></div>
       <div><span>Paid</span><span>${fmtMoney(inv.paid)}</span></div>
-      ${inv.status !== 'void' && inv.balance > 0 ? `<div><b>Balance due</b><b>${fmtMoney(inv.balance)}</b></div>` : ''}</div>
+      ${inv.interest_accrued > 0 ? `<div><span>Credit interest accrued (${S.settings.credit_interest_monthly}% monthly, simple)</span><span>${fmtMoney(inv.interest_accrued)}</span></div>
+      <div><span>Interest paid</span><span>${fmtMoney(inv.interest_paid)}</span></div>` : ''}
+      ${inv.status !== 'void' && inv.interest_balance > 0 ? `<div><span>Interest outstanding</span><span>${fmtMoney(inv.interest_balance)}</span></div>` : ''}
+      ${inv.status !== 'void' && inv.total_due > 0 ? `<div><b>Balance due</b><b>${fmtMoney(inv.total_due)}</b></div>` : ''}</div>
     ${inv.payments.length ? `<p class="inv-pay">Payments: ${inv.payments.map(p => `${fmtMoney(p.amount)} by ${esc(p.method)} on ${fmtDay(p.date)}`).join('; ')}</p>` : ''}
     ${inv.notes ? `<p class="inv-pay">Note: ${esc(inv.notes)}</p>` : ''}
     ${s.footer_note ? `<p class="inv-foot">${esc(s.footer_note)}</p>` : ''}</article>`;
 }
+function whatsappPhone(phone) {
+  let number = String(phone || '').replace(/\D/g, '');
+  if (number.length === 10 && S.settings.country_code) number = S.settings.country_code + number;
+  return number;
+}
+function whatsappWebLink(phone, message) {
+  const number = whatsappPhone(phone);
+  return number ? `https://web.whatsapp.com/send?phone=${encodeURIComponent(number)}&text=${encodeURIComponent(message)}` : '';
+}
+function customerReminder(customer) {
+  return `Hello ${customer.name}, a friendly payment reminder from ${S.settings.business_name}. ` +
+    `Your pending bill balance is ${fmtMoney(customer.due)}` +
+    (customer.interest_due > 0 ? `, including ${fmtMoney(customer.interest_due)} accrued interest` : '') +
+    `. Please let us know if you have already paid. Thank you.`;
+}
 function whatsappLink(inv) {
-  let d = (inv.customer.phone || '').replace(/\D/g, ''); if (!d) return '';
-  if (d.length === 10 && S.settings.country_code) d = S.settings.country_code + d;
-  const msg = `${S.settings.business_name}\nInvoice ${inv.number} (${fmtDay(inv.date)})\nTotal: ${fmtMoney(inv.grand_total)}` +
-    (inv.balance > 0 && inv.status !== 'void' ? `\nBalance due: ${fmtMoney(inv.balance)}` : '') + `\n${S.settings.footer_note || ''}`;
-  return `https://wa.me/${d}?text=${encodeURIComponent(msg)}`;
+  const reminder = inv.status !== 'void' && inv.total_due > 0;
+  const message = reminder
+    ? `Hello ${inv.customer.name}, a friendly payment reminder from ${S.settings.business_name} for invoice ${inv.number} dated ${fmtDay(inv.date)}. ` +
+      `Bill total: ${fmtMoney(inv.grand_total)}.` +
+      (inv.interest_accrued > 0 ? ` Interest accrued: ${fmtMoney(inv.interest_accrued)}.` : '') +
+      (inv.interest_paid > 0 ? ` Interest paid: ${fmtMoney(inv.interest_paid)}.` : '') +
+      ` Amount due: ${fmtMoney(inv.total_due)}. Please let us know if you have already paid. Thank you.`
+    : `${S.settings.business_name}\nInvoice ${inv.number} (${fmtDay(inv.date)})\nTotal: ${fmtMoney(inv.grand_total)}\n${S.settings.footer_note || ''}`;
+  return whatsappWebLink(inv.customer.phone, message);
 }
 function showInvoice(inv) {
   S.current = inv;
-  const wa = whatsappLink(inv), due = inv.status !== 'void' && inv.balance > 0;
+  const wa = whatsappLink(inv), due = inv.status !== 'void' && inv.total_due > 0;
   openModal('Invoice ' + inv.number, invoiceHTML(inv) + `<div class="dlg-actions">
     <button class="btn" data-act="print-inv">${ic('print')} Print</button>
-    ${wa ? `<a class="btn ghost" href="${wa}" target="_blank" rel="noopener">Send on WhatsApp</a>` : ''}
+    ${wa ? `<a class="btn ghost" href="${wa}" target="_blank" rel="noopener noreferrer">${due ? 'Remind on WhatsApp Web' : 'Send bill on WhatsApp Web'}</a>` : ''}
     ${due ? '<button class="btn ghost" data-act="pay-inv">Record payment</button>' : ''}
     ${inv.status !== 'void' ? '<button class="btn danger push" data-act="void-inv">Void bill</button>' : ''}</div>`, {wide: true});
 }
 actions['print-inv'] = () => { $('#print-area').innerHTML = invoiceHTML(S.current); window.print(); };
 actions['pay-inv'] = () => {
   const inv = S.current;
-  openModal('Record payment', `<form data-form="pay" class="stack"><p class="muted">${esc(inv.number)}, balance due <b class="num">${fmtMoney(inv.balance)}</b></p>
-    ${field('Amount received', 'amount', inv.balance, 'required inputmode="decimal" autofocus')}
+  openModal('Record payment', `<form data-form="pay" class="stack"><p class="muted">${esc(inv.number)}, total due <b class="num">${fmtMoney(inv.total_due)}</b> (bill principal ${fmtMoney(inv.balance)}, interest ${fmtMoney(inv.interest_balance)})</p>
+    <p class="muted">Payments reduce bill principal first, then accrued interest.</p>
+    ${field('Amount received', 'amount', inv.total_due, 'required inputmode="decimal" autofocus')}
     <label class="f"><span>Paid by</span><select name="method">${['Cash', 'UPI'].map(m => `<option>${m}</option>`).join('')}</select></label>
     <button class="btn">Save payment</button></form>`);
 };
@@ -2199,7 +2445,10 @@ async function vSettings() {
     <div class="grid2">
     <form class="card stack" data-form="settings"><h2>Shop details</h2>
       ${field('Shop name', 'business_name', s.business_name, 'required')}${field('Address', 'address', s.address)}
-      <div class="two">${field('Phone', 'phone', s.phone, 'type="tel"')}${field('GSTIN', 'gstin', s.gstin)}</div>
+      <div class="two">${field('Phone', 'phone', s.phone, 'type="tel"')}${field('UPI ID', 'upi_id', s.upi_id || '', 'maxlength="164" placeholder="name@bank"')}</div>
+      ${field('Credit interest (% per month)', 'credit_interest_monthly', s.credit_interest_monthly || 0, 'type="number" inputmode="decimal" min="0" max="100" step="0.01" required')}
+      <p class="muted">Simple interest is added monthly on unpaid bill principal. Payments reduce principal first; interest does not compound. This rate applies to existing unpaid credit bills from their invoice dates as well as new credit bills.</p>
+      ${field('GSTIN', 'gstin', s.gstin)}
       <div class="two">${field('Currency symbol', 'currency', s.currency, 'maxlength="4"')}${field('Invoice number prefix', 'invoice_prefix', s.invoice_prefix, 'maxlength="12"')}</div>
       ${field('Country code for WhatsApp', 'country_code', s.country_code, 'inputmode="numeric" maxlength="4"')}
       ${field('Message at the bottom of invoices', 'footer_note', s.footer_note)}
@@ -2218,6 +2467,9 @@ async function vSettings() {
       <p class="muted">Everything is stored in one JSON file on the computer running StockBill. A copy is also kept each day in a backups folder next to it.</p>
       <p style="overflow-wrap:anywhere"><b>Data file:</b> ${esc(i.data_file || '')}</p>
       <div class="chips"><button class="btn ghost" data-act="dl-backup">Download backup</button><button class="btn ghost" data-act="dl-csv">Download invoices CSV</button></div></div>
+    <div class="card stack"><h2>WhatsApp Web</h2>
+      <p class="muted">Link this browser using WhatsApp's official QR code. Open WhatsApp Web, scan the QR code with WhatsApp on your phone, then use the reminder links on customer and invoice bills. Messages open as drafts for you to review and send.</p>
+      <p><a class="btn ghost" href="https://web.whatsapp.com/" target="_blank" rel="noopener noreferrer">Open WhatsApp Web to scan QR</a></p></div>
     <div class="card stack"><h2>Use on your phone</h2>
       ${i.lan_url ? `<p>On the same Wi-Fi, open <b style="overflow-wrap:anywhere">${esc(i.lan_url)}</b> in your phone's browser, then use "Add to Home screen".</p>` : '<p class="muted">The server was started for this computer only. Restart without <code>--host 127.0.0.1</code> to use it on a phone.</p>'}
       <p class="muted">${i.pin_enabled ? 'A PIN is required to open the app. PIN changes are saved and will remain active after restart.' : 'No PIN is set. Anyone on your Wi-Fi can open this. Set one above to lock the app.'}</p></div></div></div>`;
