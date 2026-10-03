@@ -17,7 +17,7 @@ Run:
 Features: items and stock, customers, billing with GST/tax + discounts, part payments
 and credit (dues), stock history, void bills (stock returns), print invoices,
 WhatsApp share, single-key keyboard navigation, expense register,
-cash summaries, CSV exports and JSON backup.
+cash summaries, CSV exports, JSON backup, and a persistent activity log.
 """
 import argparse
 import csv
@@ -43,6 +43,8 @@ APP_NAME = "StockBill"
 CENT = Decimal("0.01")
 MILLI = Decimal("0.001")
 PAY_METHODS = ("Cash", "UPI", "Card", "Bank", "Other")
+ACTIVITY_LOG_MAX_BYTES = 2_000_000
+ACTIVITY_LOG_BACKUPS = 5
 
 DEFAULT_SETTINGS = {
     "business_name": "My Shop",
@@ -156,6 +158,7 @@ def valid_pin(pin):
 class Store:
     def __init__(self, path):
         self.path = os.path.abspath(path)
+        self.log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stockbill.log")
         self.lock = threading.RLock()
         self.info = {}
         self.data = self._load()
@@ -183,6 +186,7 @@ class Store:
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
         except json.JSONDecodeError as e:
+            self.log_activity("technical", "Data file load failed", str(e), 500)
             sys.exit(
                 f"\nCould not read {self.path}: the file is not valid JSON ({e}).\n"
                 f"Nothing was changed. Restore from '{self.path}.bak' or the 'backups' "
@@ -234,7 +238,34 @@ class Store:
         try:
             self._write(self.data)
         except OSError as e:
+            self.log_activity("technical", "Data save failed", str(e), 500)
             raise ApiError(500, f"Could not write the data file: {e}")
+
+    def log_activity(self, category, event, details="", status=None):
+        record = {
+            "timestamp": now(),
+            "category": text(category, 20),
+            "event": text(event, 120),
+            "details": text(details, 2000),
+            "status": status,
+        }
+        encoded = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        try:
+            with self.lock:
+                if (os.path.exists(self.log_path)
+                        and os.path.getsize(self.log_path) + len(encoded) > ACTIVITY_LOG_MAX_BYTES):
+                    for index in range(ACTIVITY_LOG_BACKUPS - 1, 0, -1):
+                        source = f"{self.log_path}.{index}"
+                        if os.path.exists(source):
+                            os.replace(source, f"{self.log_path}.{index + 1}")
+                    if os.path.exists(self.log_path):
+                        os.replace(self.log_path, self.log_path + ".1")
+                with open(self.log_path, "ab") as f:
+                    f.write(encoded)
+                    f.flush()
+                    os.fsync(f.fileno())
+        except OSError as e:
+            print(f"Warning: could not write developer log {self.log_path}: {e}", file=sys.stderr)
 
     def _next(self, kind):
         self.data["counters"][kind] += 1
@@ -764,6 +795,58 @@ def qs(query, key, default=""):
     return (query.get(key) or [default])[0]
 
 
+def business_activity(method, path, result, store):
+    if method not in ("POST", "PUT", "DELETE"):
+        return None
+    if path == "/api/settings":
+        return "Shop settings updated", ""
+    if path == "/api/invoices" and isinstance(result, dict):
+        customer = result.get("customer", {}).get("name", "Walk-in customer")
+        return "Invoice created", (
+            f"{result.get('number', '')} for {customer}; total {result.get('grand_total', 0):.2f}, "
+            f"paid {result.get('paid', 0):.2f}, balance {result.get('balance', 0):.2f}"
+        )
+    match = re.fullmatch(r"/api/invoices/(\d+)/void", path)
+    if match and isinstance(result, dict):
+        return "Invoice voided", f"{result.get('number', match.group(1))}; reason: {result.get('void_reason') or 'not specified'}"
+    match = re.fullmatch(r"/api/invoices/(\d+)/payments", path)
+    if match and isinstance(result, dict):
+        payment = result.get("payments", [{}])[-1]
+        return "Payment recorded", (
+            f"{result.get('number', match.group(1))}; {payment.get('amount', 0):.2f} by "
+            f"{payment.get('method', 'unknown')}; balance {result.get('balance', 0):.2f}"
+        )
+    if path == "/api/expenses" and isinstance(result, dict):
+        return "Expense recorded", f"{result.get('category', 'Other')}; amount {result.get('amount', 0):.2f}"
+    if path == "/api/products" and isinstance(result, dict):
+        return "Item created", result.get("name", "")
+    match = re.fullmatch(r"/api/products/(\d+)", path)
+    if match:
+        if method == "DELETE":
+            action = "Item archived" if result.get("archived") else "Item deleted"
+            return action, f"Item ID {match.group(1)}"
+        if isinstance(result, dict):
+            return "Item updated", result.get("name", "")
+    match = re.fullmatch(r"/api/products/(\d+)/restore", path)
+    if match:
+        return "Item restored", result.get("name", f"Item ID {match.group(1)}")
+    if path == "/api/stock" and isinstance(result, dict):
+        stock = store.data["stock_log"][-1]
+        return "Stock adjusted", (
+            f"{result.get('name', 'Item')}; change {stock.get('change', 0):g} "
+            f"{result.get('unit', '')}; reason: {stock.get('reason', '')}"
+        )
+    if path == "/api/customers" and isinstance(result, dict):
+        return "Customer created", result.get("name", "")
+    match = re.fullmatch(r"/api/customers/(\d+)", path)
+    if match:
+        if method == "DELETE":
+            return "Customer deleted", f"Customer ID {match.group(1)}"
+        if isinstance(result, dict):
+            return "Customer updated", result.get("name", "")
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # HTTP layer
 # --------------------------------------------------------------------------- #
@@ -777,6 +860,11 @@ def build_routes(store):
     g = lambda m: int(m.group(1))
     return [
         ("GET", r"/api/info", lambda m, q, b: store.info),
+        ("POST", r"/api/client-errors", lambda m, q, b: (
+            store.log_activity("technical", "Browser error",
+                               f"{text(b.get('message'), 500)}\n{text(b.get('stack'), 1200)}", 500)
+            or {"recorded": True}
+        )),
         ("GET", r"/api/financial-years", lambda m, q, b: store.financial_years()),
         ("GET", r"/api/settings", lambda m, q, b: store.data["settings"]),
         ("PUT", r"/api/settings", lambda m, q, b: store.update_settings(b)),
@@ -866,8 +954,11 @@ def make_handler(store, pin):
                     self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except (BrokenPipeError, ConnectionResetError) as e:
+                store.log_activity(
+                    "technical", "Client disconnected before response completed",
+                    f"Remote address {self.client_address[0]}: {e}", status
+                )
 
         def _json(self, status, obj):
             self._send(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
@@ -893,6 +984,8 @@ def make_handler(store, pin):
             return body
 
         def _dispatch(self, method):
+            path = ""
+            failure_category = "technical"
             try:
                 url = urlparse(self.path)
                 path = url.path
@@ -907,12 +1000,18 @@ def make_handler(store, pin):
                     if method == "GET":
                         return self._json(200, {"pin_enabled": pin_enabled()})
                     if method == "POST":
+                        failure_category = "security"
                         candidate = body.get("pin", "")
                         if pin_enabled() and not pin_matches(candidate):
                             raise ApiError(401, "Incorrect PIN")
+                        store.log_activity(
+                            "security", "Sign-in succeeded",
+                            f"Remote address {self.client_address[0]}", 200
+                        )
                         return self._json(200, {"authenticated": True})
                     raise ApiError(405, "Method not allowed")
                 if path == "/api/pin":
+                    failure_category = "security"
                     if method != "POST":
                         raise ApiError(405, "Method not allowed")
                     with store.lock:
@@ -929,12 +1028,23 @@ def make_handler(store, pin):
                         pin_state["hash"] = store.data["security"]["pin_hash"]
                         pin_state["plain"] = ""
                         store.info["pin_enabled"] = True
+                    store.log_activity("security", "PIN changed", "The shop PIN was updated", 200)
                     return self._json(200, {"pin_enabled": True})
                 if not path.startswith("/api/"):
                     raise ApiError(404, "Not found")
                 if pin_enabled() and not pin_matches(self.headers.get("X-Pin") or ""):
+                    failure_category = "security"
                     raise ApiError(401, "PIN required")
                 query = parse_qs(url.query)
+                if path == "/api/logout":
+                    failure_category = "security"
+                    if method != "POST":
+                        raise ApiError(405, "Method not allowed")
+                    store.log_activity(
+                        "security", "Signed out",
+                        f"Remote address {self.client_address[0]}", 200
+                    )
+                    return self._json(200, {"logged_out": True})
                 path_ok = False
                 for meth, pattern, fn in routes:
                     m = pattern.fullmatch(path)
@@ -945,6 +1055,9 @@ def make_handler(store, pin):
                         continue
                     with store.lock:  # compute AND serialize while no other request can modify the data
                         result = fn(m, query, body)
+                        activity = business_activity(method, path, result, store)
+                        if activity:
+                            store.log_activity("business", activity[0], activity[1], 200)
                         payload = None if isinstance(result, Raw) else json.dumps(result, ensure_ascii=False).encode("utf-8")
                     if isinstance(result, Raw):
                         extra = {"Content-Disposition": f'attachment; filename="{result.filename}"'} if result.filename else {}
@@ -952,9 +1065,18 @@ def make_handler(store, pin):
                     return self._send(200, payload, "application/json; charset=utf-8")
                 raise ApiError(405 if path_ok else 404, "Method not allowed" if path_ok else "Not found")
             except ApiError as e:
+                if path.startswith("/api/"):
+                    store.log_activity(
+                        failure_category, "Request rejected",
+                        f"{method} {path} returned HTTP {e.status}: {e.message}", e.status
+                    )
                 self._json(e.status, {"error": e.message})
             except Exception:
+                stack = traceback.format_exc()
                 traceback.print_exc()
+                store.log_activity(
+                    "technical", "Server exception", f"{method} {path}\n{stack}", 500
+                )
                 self._json(500, {"error": "Something went wrong on the server"})
 
         def do_GET(self):
@@ -1041,8 +1163,10 @@ def main():
     try:
         server = Server((args.host, args.port), make_handler(store, args.pin))
     except OSError as e:
+        store.log_activity("technical", "Server startup failed", str(e), 500)
         sys.exit(f"Could not start on port {args.port}: {e}\nTry another port, e.g.  --port 8080")
 
+    store.log_activity("technical", "Server started", f"Listening on {args.host}:{args.port}", 200)
     local = f"http://localhost:{args.port}"
     print(f"\n{APP_NAME} is running")
     print(f"  This computer : {local}")
@@ -1058,7 +1182,11 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped. Your data is saved.")
+    except Exception:
+        store.log_activity("technical", "Server stopped unexpectedly", traceback.format_exc(), 500)
+        raise
     finally:
+        store.log_activity("technical", "Server stopped", "HTTP server closed")
         server.server_close()
 
 
@@ -1388,10 +1516,11 @@ const stockBadge = p => {
 const matches = (p, q) => !q || `${p.name} ${p.sku} ${p.category}`.toLowerCase().includes(q.toLowerCase());
 
 /* ---------- api ---------- */
-let sessionPin = '', loginEnabled = false;
+let sessionPin = '', loginEnabled = false, sessionActive = false;
 try { localStorage.removeItem('sb_pin'); } catch (_) {}
 function showLogin(pinRequired, message = '') {
   sessionPin = '';
+  sessionActive = false;
   $('#app').hidden = true;
   $('#login-screen').hidden = false;
   $('#login-pin-wrap').hidden = !pinRequired;
@@ -1419,6 +1548,24 @@ async function api(path, opts = {}) {
   if (!res.ok) throw new Error(data.error || 'Something went wrong');
   return data;
 }
+function reportClientError(message, stack = '') {
+  if (!sessionActive) return;
+  const headers = {'Content-Type': 'application/json'};
+  if (sessionPin) headers['X-Pin'] = sessionPin;
+  fetch('/api/client-errors', {
+    method: 'POST', headers,
+    body: JSON.stringify({message: String(message).slice(0, 500), stack: String(stack).slice(0, 1200)})
+  }).then(response => {
+    if (!response.ok) console.error('Could not save the browser error in the activity log.');
+  }).catch(error => console.error('Could not send the browser error to StockBill.', error));
+}
+window.addEventListener('error', event => {
+  reportClientError(event.message || 'Uncaught browser error', event.error && event.error.stack);
+});
+window.addEventListener('unhandledrejection', event => {
+  const reason = event.reason;
+  reportClientError(reason && reason.message ? reason.message : String(reason), reason && reason.stack);
+});
 async function download(path, name) {
   const headers = {}; if (sessionPin) headers['X-Pin'] = sessionPin;
   const r = await fetch('/api' + path, {headers});
@@ -1472,6 +1619,7 @@ $('#login-form').addEventListener('submit', async e => {
       return;
     }
     sessionPin = candidate;
+    sessionActive = true;
     $('#login-screen').hidden = true;
     $('#app').hidden = false;
     await startApp();
@@ -1593,10 +1741,14 @@ function renderNav() {
 actions.go = el => { closeModal(); location.hash = '#/' + el.dataset.to; };
 actions.close = () => closeModal();
 actions.logout = () => {
+  return api('/logout', {method: 'POST', body: {}}).catch(err => {
+    toast(`Could not record sign out: ${err.message}`, 'err');
+  }).finally(() => {
   closeModal();
   sessionPin = '';
   $('#login-pin').value = '';
   showLogin(loginEnabled);
+  });
 };
 actions['new-bill'] = () => {
   closeModal();
@@ -2064,7 +2216,7 @@ async function vSettings() {
       </form></div>
     <div class="card stack"><h2>Your data</h2>
       <p class="muted">Everything is stored in one JSON file on the computer running StockBill. A copy is also kept each day in a backups folder next to it.</p>
-      <p style="overflow-wrap:anywhere"><b>File:</b> ${esc(i.data_file || '')}</p>
+      <p style="overflow-wrap:anywhere"><b>Data file:</b> ${esc(i.data_file || '')}</p>
       <div class="chips"><button class="btn ghost" data-act="dl-backup">Download backup</button><button class="btn ghost" data-act="dl-csv">Download invoices CSV</button></div></div>
     <div class="card stack"><h2>Use on your phone</h2>
       ${i.lan_url ? `<p>On the same Wi-Fi, open <b style="overflow-wrap:anywhere">${esc(i.lan_url)}</b> in your phone's browser, then use "Add to Home screen".</p>` : '<p class="muted">The server was started for this computer only. Restart without <code>--host 127.0.0.1</code> to use it on a phone.</p>'}
