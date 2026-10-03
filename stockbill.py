@@ -157,6 +157,17 @@ def pin_digest(pin, salt):
     return hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, 200_000)
 
 
+def stored_pin_matches(candidate, salt_hex, hash_hex):
+    if not isinstance(candidate, str) or not salt_hex or not hash_hex:
+        return False
+    try:
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(hash_hex)
+    except ValueError:
+        return False
+    return hmac.compare_digest(pin_digest(candidate, salt), expected)
+
+
 def valid_pin(pin):
     return isinstance(pin, str) and re.fullmatch(r"\d{4,12}", pin) is not None
 
@@ -191,7 +202,10 @@ class Store:
             "version": 1,
             "counters": {"product": 0, "customer": 0, "invoice": 0, "stock": 0, "expense": 0},
             "settings": dict(DEFAULT_SETTINGS),
-            "security": {"pin_salt": "", "pin_hash": ""},
+            "security": {
+                "pin_salt": "", "pin_hash": "",
+                "mobile_pin_salt": "", "mobile_pin_hash": "",
+            },
             "products": [],
             "customers": [],
             "invoices": [],
@@ -367,6 +381,21 @@ class Store:
                 "pin_salt": salt.hex(),
                 "pin_hash": pin_digest(pin, salt).hex(),
             }
+            self._commit()
+
+    def update_mobile_pin(self, pin):
+        if not valid_pin(pin):
+            raise ApiError(400, "Mobile PIN must contain 4 to 12 digits")
+        salt = secrets.token_bytes(16)
+        with self.lock:
+            self.data["security"]["mobile_pin_salt"] = salt.hex()
+            self.data["security"]["mobile_pin_hash"] = pin_digest(pin, salt).hex()
+            self._commit()
+
+    def disable_mobile_pin(self):
+        with self.lock:
+            self.data["security"]["mobile_pin_salt"] = ""
+            self.data["security"]["mobile_pin_hash"] = ""
             self._commit()
 
     # -- products ---------------------------------------------------------- #
@@ -589,7 +618,7 @@ class Store:
             month += 1
         return money(accrued)
 
-    def create_invoice(self, p):
+    def create_invoice(self, p, mobile=False):
         with self.lock:
             raw_items = p.get("items")
             if not isinstance(raw_items, list) or not raw_items:
@@ -648,6 +677,12 @@ class Store:
             paid = money(dec(p.get("paid"), "Amount paid", Decimal(0)))
             if paid < 0:
                 raise ApiError(400, "Amount paid cannot be negative")
+            if mobile and p.get("payment_method") == "Credit" and paid != 0:
+                raise ApiError(400, "Credit transactions cannot include an upfront payment")
+            if mobile and p.get("payment_method") in ("Cash", "UPI") and paid > grand:
+                raise ApiError(400, "Amount paid cannot be more than the bill total")
+            if mobile and p.get("payment_method") in ("Cash", "UPI") and grand > 0 and paid == 0:
+                raise ApiError(400, "Use Credit for a transaction with no upfront payment")
             paid = min(paid, grand)
             if paid < grand and customer is None:
                 raise ApiError(400, "Choose a customer when the bill is not fully paid")
@@ -1044,6 +1079,10 @@ def make_handler(store, pin):
         "hash": security.get("pin_hash", ""),
         "plain": pin if not security.get("pin_hash") else "",
     }
+    mobile_pin_state = {
+        "salt": security.get("mobile_pin_salt", ""),
+        "hash": security.get("mobile_pin_hash", ""),
+    }
 
     def pin_enabled():
         return bool(pin_state["hash"] or pin_state["plain"])
@@ -1052,16 +1091,14 @@ def make_handler(store, pin):
         if not isinstance(candidate, str):
             return False
         if pin_state["hash"]:
-            try:
-                salt = bytes.fromhex(pin_state["salt"])
-                expected = bytes.fromhex(pin_state["hash"])
-            except ValueError:
-                return False
-            return hmac.compare_digest(pin_digest(candidate, salt), expected)
+            return stored_pin_matches(candidate, pin_state["salt"], pin_state["hash"])
         return bool(pin_state["plain"]) and hmac.compare_digest(
             candidate.encode("utf-8"), pin_state["plain"].encode("utf-8")
         )
+    def mobile_pin_matches(candidate):
+        return stored_pin_matches(candidate, mobile_pin_state["salt"], mobile_pin_state["hash"])
     page = PAGE.encode("utf-8")
+    mobile_page = MOBILE_PAGE.encode("utf-8")
     manifest = json.dumps({
         "name": APP_NAME, "short_name": APP_NAME, "start_url": "/", "display": "standalone",
         "background_color": "#F1F4F2", "theme_color": "#14303A",
@@ -1130,6 +1167,8 @@ def make_handler(store, pin):
                 body = self._read_body()  # always drain the body first (keep-alive safe)
                 if method == "GET" and path in ("/", "/index.html"):
                     return self._send(200, page, "text/html; charset=utf-8")
+                if method == "GET" and path in ("/mobile", "/mobile/"):
+                    return self._send(200, mobile_page, "text/html; charset=utf-8")
                 if method == "GET" and path == "/manifest.json":
                     return self._send(200, manifest, "application/manifest+json")
                 if method == "GET" and path == "/icon.svg":
@@ -1148,6 +1187,21 @@ def make_handler(store, pin):
                         )
                         return self._json(200, {"authenticated": True})
                     raise ApiError(405, "Method not allowed")
+                if path == "/api/mobile/login":
+                    if method == "GET":
+                        return self._json(200, {"pin_enabled": bool(mobile_pin_state["hash"])})
+                    if method == "POST":
+                        failure_category = "security"
+                        if not mobile_pin_state["hash"]:
+                            raise ApiError(403, "Mobile billing access is not configured")
+                        if not mobile_pin_matches(body.get("pin", "")):
+                            raise ApiError(401, "Incorrect mobile PIN")
+                        store.log_activity(
+                            "security", "Mobile billing sign-in succeeded",
+                            f"Remote address {self.client_address[0]}", 200
+                        )
+                        return self._json(200, {"authenticated": True})
+                    raise ApiError(405, "Method not allowed")
                 if path == "/api/pin":
                     failure_category = "security"
                     if method != "POST":
@@ -1161,6 +1215,8 @@ def make_handler(store, pin):
                         new_pin = body.get("new_pin")
                         if not valid_pin(new_pin):
                             raise ApiError(400, "New PIN must contain 4 to 12 digits")
+                        if mobile_pin_matches(new_pin):
+                            raise ApiError(400, "Choose a shop PIN different from the mobile PIN")
                         store.update_pin(new_pin)
                         pin_state["salt"] = store.data["security"]["pin_salt"]
                         pin_state["hash"] = store.data["security"]["pin_hash"]
@@ -1170,6 +1226,50 @@ def make_handler(store, pin):
                     return self._json(200, {"pin_enabled": True})
                 if not path.startswith("/api/"):
                     raise ApiError(404, "Not found")
+                if path.startswith("/api/mobile/"):
+                    failure_category = "security"
+                    if not mobile_pin_state["hash"] or not mobile_pin_matches(
+                            self.headers.get("X-Mobile-Pin") or ""):
+                        raise ApiError(401, "Mobile PIN required")
+                    query = parse_qs(url.query)
+                    if method == "GET" and path == "/api/mobile/products":
+                        products = store.list_products()
+                        result = [{
+                            key: product[key]
+                            for key in ("id", "name", "sku", "category", "unit", "price",
+                                        "tax_rate", "stock", "low_stock", "active")
+                        } for product in products if product["active"]]
+                    elif method == "GET" and path == "/api/mobile/customers":
+                        result = [{
+                            key: customer[key]
+                            for key in ("id", "name", "phone", "due", "interest_due")
+                        } for customer in store.list_customers()]
+                    elif method == "GET" and path == "/api/mobile/settings":
+                        settings = store.data["settings"]
+                        result = {key: settings[key] for key in (
+                            "business_name", "currency", "round_off", "allow_negative_stock",
+                            "upi_id", "country_code",
+                        )}
+                    elif method == "GET" and path == "/api/mobile/upi-qr":
+                        return self._send(
+                            200, store.upi_qr(query), "image/svg+xml; charset=utf-8"
+                        )
+                    elif method == "POST" and path == "/api/mobile/invoices":
+                        payment_method = body.get("payment_method")
+                        if payment_method not in ("Cash", "UPI", "Credit"):
+                            raise ApiError(400, "Choose Cash, UPI, or Credit")
+                        if payment_method == "Credit" and (
+                                not body.get("customer_id")
+                                or dec(body.get("paid"), "Amount paid", Decimal(0)) != 0):
+                            raise ApiError(400, "Credit transactions require a customer and no upfront payment")
+                        result = store.create_invoice(body, mobile=True)
+                        activity = business_activity(method, "/api/invoices", result, store)
+                        if activity:
+                            store.log_activity("business", activity[0], activity[1], 200)
+                    else:
+                        raise ApiError(404, "Mobile endpoint not found")
+                    payload = json.dumps(result, ensure_ascii=False).encode("utf-8")
+                    return self._send(200, payload, "application/json; charset=utf-8")
                 if pin_enabled() and not pin_matches(self.headers.get("X-Pin") or ""):
                     failure_category = "security"
                     raise ApiError(401, "PIN required")
@@ -1183,6 +1283,30 @@ def make_handler(store, pin):
                         f"Remote address {self.client_address[0]}", 200
                     )
                     return self._json(200, {"logged_out": True})
+                if path == "/api/mobile-pin":
+                    failure_category = "security"
+                    if method != "POST":
+                        raise ApiError(405, "Method not allowed")
+                    if body.get("disable"):
+                        store.disable_mobile_pin()
+                        mobile_pin_state.update(salt="", hash="")
+                        store.info["mobile_pin_enabled"] = False
+                        store.log_activity(
+                            "security", "Mobile billing access disabled",
+                            "The mobile access PIN was removed", 200
+                        )
+                        return self._json(200, {"mobile_pin_enabled": False})
+                    new_pin = body.get("new_pin")
+                    if not valid_pin(new_pin):
+                        raise ApiError(400, "Mobile PIN must contain 4 to 12 digits")
+                    if pin_matches(new_pin):
+                        raise ApiError(400, "Choose a mobile PIN different from the shop PIN")
+                    store.update_mobile_pin(new_pin)
+                    mobile_pin_state["salt"] = store.data["security"]["mobile_pin_salt"]
+                    mobile_pin_state["hash"] = store.data["security"]["mobile_pin_hash"]
+                    store.info["mobile_pin_enabled"] = True
+                    store.log_activity("security", "Mobile billing PIN updated", "", 200)
+                    return self._json(200, {"mobile_pin_enabled": True})
                 path_ok = False
                 for meth, pattern, fn in routes:
                     m = pattern.fullmatch(path)
@@ -1290,12 +1414,18 @@ def main():
     store = Store(args.data)
     if args.demo:
         seed_demo(store)
+    if args.pin and store.data["security"].get("mobile_pin_hash"):
+        if stored_pin_matches(
+                args.pin, store.data["security"]["mobile_pin_salt"],
+                store.data["security"]["mobile_pin_hash"]):
+            sys.exit("The startup shop PIN must be different from the configured mobile billing PIN.")
 
     ip = lan_ip() if args.host in ("0.0.0.0", "") else None
     store.info = {
         "data_file": store.path,
         "lan_url": f"http://{ip}:{args.port}" if ip else None,
         "pin_enabled": bool(args.pin or store.data["security"]["pin_hash"]),
+        "mobile_pin_enabled": bool(store.data["security"]["mobile_pin_hash"]),
     }
 
     try:
@@ -2463,6 +2593,16 @@ async function vSettings() {
         ${field('Confirm new PIN', 'confirm_pin', '', 'type="password" inputmode="numeric" autocomplete="new-password" minlength="4" maxlength="12" pattern="[0-9]{4,12}" required')}
         <button class="btn">Save PIN</button>
       </form></div>
+    <div class="card stack"><h2>Mobile billing access</h2>
+      <p class="muted">${i.mobile_pin_enabled ? 'Mobile billing is protected by its own PIN.' : 'Set a separate PIN to enable the billing-only mobile page.'} Use 4 to 12 digits, different from the shop PIN.</p>
+      <form class="stack" data-form="mobile-pin">
+        ${field(i.mobile_pin_enabled ? 'New mobile PIN' : 'Mobile PIN', 'new_pin', '', 'type="password" inputmode="numeric" autocomplete="new-password" minlength="4" maxlength="12" pattern="[0-9]{4,12}" required')}
+        ${field('Confirm mobile PIN', 'confirm_pin', '', 'type="password" inputmode="numeric" autocomplete="new-password" minlength="4" maxlength="12" pattern="[0-9]{4,12}" required')}
+        <button class="btn">Save mobile PIN</button>
+      </form>
+      ${i.mobile_pin_enabled ? '<button class="btn danger" data-act="disable-mobile-billing">Disable mobile billing</button>' : ''}
+      ${i.lan_url ? `<p>On the same Wi-Fi, open <b style="overflow-wrap:anywhere">${esc(i.lan_url)}/mobile</b> on the phone.</p>` : '<p class="muted">Start StockBill on your Wi-Fi interface to access the mobile page from another device.</p>'}
+      <p class="muted">This page only supports billing; its PIN cannot access the main app APIs. Use only on a trusted private Wi-Fi network: HTTP does not encrypt the PIN or transaction data. Camera scanning requires HTTPS, so on this HTTP page use search, type a SKU/barcode, or connect a keyboard-style scanner.</p></div>
     <div class="card stack"><h2>Your data</h2>
       <p class="muted">Everything is stored in one JSON file on the computer running StockBill. A copy is also kept each day in a backups folder next to it.</p>
       <p style="overflow-wrap:anywhere"><b>Data file:</b> ${esc(i.data_file || '')}</p>
@@ -2490,6 +2630,21 @@ forms.pin = async f => {
   toast('PIN saved', 'ok');
   render();
 };
+forms['mobile-pin'] = async f => {
+  const data = Object.fromEntries(new FormData(f));
+  if (data.new_pin !== data.confirm_pin) throw new Error('Mobile PIN and confirmation do not match');
+  await api('/mobile-pin', {method: 'POST', body: {new_pin: data.new_pin}});
+  S.info.mobile_pin_enabled = true;
+  toast('Mobile billing PIN saved', 'ok');
+  render();
+};
+actions['disable-mobile-billing'] = async () => {
+  if (!confirm('Disable access to the mobile billing page?')) return;
+  await api('/mobile-pin', {method: 'POST', body: {disable: true}});
+  S.info.mobile_pin_enabled = false;
+  toast('Mobile billing access disabled', 'ok');
+  render();
+};
 actions['dl-backup'] = () => download('/export/backup.json', `stockbill-backup-${new Date().toISOString().slice(0, 10)}.json`);
 /* ================= ACCOUNTS ================= */
 async function vAccounts() {
@@ -2499,7 +2654,7 @@ async function vAccounts() {
   S.expenses = expenses;
   const yearLabel = S.financialYear === 'all' ? 'all years' : financialYearLabel(S.financialYear);
   return `<header class="page-head"><div><h1>Accounts</h1><p class="muted">Financial summary and expenses for ${yearLabel}</p></div>
-      <div class="chips"><button class="btn ghost" data-act="dl-expenses">Export expenses</button><button class="btn" data-act="new-expense">Record expense</button></div></header>
+      <div class="chips"><button class="btn ghost" data-act="prepare-wa-reminders">Prepare WhatsApp reminders</button><button class="btn ghost" data-act="dl-expenses">Export expenses</button><button class="btn" data-act="new-expense">Record expense</button></div></header>
     <section class="tiles">
       <div class="tile"><span class="muted">Cash collected</span><b class="num">${fmtMoney(summary.year_collected)}</b><span class="muted">Payments received during ${yearLabel}</span></div>
       <div class="tile"><span class="muted">Expenses</span><b class="num">${fmtMoney(summary.year_expenses)}</b><span class="muted">${summary.year_expense_count} recorded</span></div>
@@ -2511,6 +2666,20 @@ async function vAccounts() {
     <div class="toolbar"><div class="search">${ic('search')}<input data-in="eq" value="${esc(S.q.expenses)}" placeholder="Search category, party, reference or note" aria-label="Search expenses"></div></div>
     <div class="list" id="expense-list">${expenseRows()}</div>`;
 }
+actions['prepare-wa-reminders'] = async () => {
+  const customers = await api('/customers');
+  const owing = customers.filter(customer => customer.due > 0);
+  const reachable = owing.filter(customer => whatsappPhone(customer.phone));
+  const totalDue = owing.reduce((total, customer) => total + customer.due, 0);
+  const rows = reachable.map(customer => `<div class="row">
+    <div class="r-main"><b>${esc(customer.name)}</b><span class="muted">${esc(customer.phone)}</span></div>
+    <div class="num r-right"><b>${fmtMoney(customer.due)} due</b>${customer.interest_due > 0 ? `<span class="muted">${fmtMoney(customer.interest_due)} interest</span>` : ''}</div>
+    <div class="r-act"><a class="btn ghost sm" href="${whatsappWebLink(customer.phone, customerReminder(customer))}" target="_blank" rel="noopener noreferrer">Open reminder draft</a></div></div>`).join('');
+  const unavailable = owing.length - reachable.length;
+  openModal('WhatsApp payment reminders', `<p class="muted">Outstanding total: <b class="num">${fmtMoney(totalDue)}</b> across ${owing.length} ${owing.length === 1 ? 'customer' : 'customers'}. Select a draft to open it in WhatsApp Web, review it, and send it yourself. Nothing is sent automatically.</p>
+    ${rows ? `<div class="list">${rows}</div>` : '<div class="empty">No customers with a phone number and a pending balance are ready for a reminder.</div>'}
+    ${unavailable ? `<p class="muted" style="margin-top:12px">${unavailable} ${unavailable === 1 ? 'customer has' : 'customers have'} a pending balance but no usable phone number; add a phone number in Customers to prepare a reminder.</p>` : ''}`);
+};
 function expenseRows() {
   const q = S.q.expenses.toLowerCase();
   const rows = (S.expenses || []).filter(expense => !q ||
@@ -2564,6 +2733,262 @@ async function startApp() {
 </body>
 </html>
 """
+
+MOBILE_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#14303A"><title>StockBill mobile billing</title>
+<style>
+:root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#18343b;background:#f1f4f2;font-size:16px}
+*{box-sizing:border-box}body{margin:0}button,input,select,textarea{font:inherit}button{min-height:44px;border:0;border-radius:9px;padding:10px 14px;background:#14303a;color:white;font-weight:700}
+input,select,textarea{width:100%;min-height:44px;border:1px solid #d4dedb;border-radius:8px;padding:10px;background:#fff;color:inherit}
+main{max-width:720px;margin:auto;padding:14px;padding-bottom:40px}.card{background:white;border:1px solid #dce4e1;border-radius:12px;padding:16px;margin-bottom:12px}
+h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7f;font-size:14px}.stack{display:grid;gap:10px}
+.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.brand small{display:block;color:#687b7f;font-weight:500}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.product,.line{border:1px solid #e0e7e4;border-radius:9px;padding:11px;background:white;color:inherit;text-align:left}
+.product{display:flex;flex-direction:column;gap:4px;min-height:92px}.product:disabled{opacity:.5}.product small,.line small{color:#687b7f}
+.line{display:grid;grid-template-columns:1fr auto;gap:7px;margin-bottom:8px}.steps{display:flex;align-items:center;gap:8px}.steps button{min-width:42px;padding:6px}.steps b{min-width:26px;text-align:center}
+.discount{grid-column:1/-1;max-width:160px}
+.chips{display:flex;gap:8px}.chips button{flex:1;background:#eef3f1;color:#18343b;border:1px solid #d4dedb}.chips button.on{background:#14303a;color:white}
+.total{display:flex;justify-content:space-between;padding:10px 0;font-weight:800;font-size:18px;border-top:1px solid #e0e7e4}
+.primary{width:100%;background:#f2a900;color:#18343b}.notice{padding:10px;background:#fff1d6;border-radius:8px}.error{color:#a52828}.qr{display:flex;align-items:center;gap:12px}.qr img{width:120px;height:120px}
+[hidden]{display:none!important}
+</style></head>
+<body><main>
+  <section id="login" class="card stack">
+    <div class="brand"><h1>StockBill</h1><small>Mobile billing</small></div>
+    <p id="login-help" class="muted">Enter the mobile billing PIN.</p>
+    <form id="login-form" class="stack"><input id="pin" type="password" inputmode="numeric" autocomplete="one-time-code" minlength="4" maxlength="12" placeholder="Mobile PIN" aria-label="Mobile PIN" required><button>Sign in</button></form>
+    <p id="login-error" class="error" role="alert"></p>
+    <p class="muted">The mobile PIN only grants access to billing. Use only on a trusted private Wi-Fi network because HTTP is unencrypted. Camera scanning is unavailable on HTTP; search or enter an item SKU/barcode.</p>
+  </section>
+  <section id="app" hidden>
+    <header class="head"><div class="brand"><h1 id="shop-name">StockBill</h1><small>New transaction</small></div><button id="logout" type="button">Log out</button></header>
+    <section class="card stack">
+      <h2>Find items</h2>
+      <input id="search" autocomplete="off" placeholder="Search item or enter SKU/barcode" aria-label="Search item or enter SKU/barcode">
+      <p class="muted">A keyboard-style barcode reader can type into this field and press Enter.</p>
+      <div id="products" class="grid"></div>
+    </section>
+    <section class="card stack">
+      <h2>Current bill</h2>
+      <label class="stack"><span>Customer <b id="customer-required" hidden>(required for credit or part payment)</b></span><select id="customer"></select></label>
+      <div id="cart"></div>
+      <div class="total"><span>Total</span><span id="total"></span></div>
+      <div class="chips" role="group" aria-label="Payment method">
+        <button type="button" data-pay="Cash">Cash</button>
+        <button type="button" data-pay="UPI">UPI</button>
+        <button type="button" data-pay="Credit">Credit</button>
+      </div>
+      <button id="part-toggle" class="chips" type="button">Record part payment</button>
+      <label id="part-amount-wrap" class="stack" hidden><span>Amount received</span><input id="part-amount" type="number" min="0" step="0.01" inputmode="decimal"></label>
+      <p id="credit-note" class="muted" hidden>The full bill amount will be added to this customer's pending balance.</p>
+      <div id="qr-wrap" class="qr notice" hidden><img id="qr" alt="UPI payment QR"><span id="qr-label"></span></div>
+      <label class="stack"><span>Note</span><input id="note" maxlength="200" placeholder="Optional"></label>
+      <button id="save" class="primary" type="button">Save bill</button>
+      <p id="status" role="status"></p>
+    </section>
+  </section>
+</main>
+<script>
+(() => {
+  const $ = selector => document.querySelector(selector);
+  const state = {pin:'',products:[],customers:[],settings:{},cart:[],customer:'',method:'Cash',part:false,qrUrl:'',qrRequest:0};
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  const money = value => `${state.settings.currency || '₹'}${Number(value || 0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+  async function request(path, options={}) {
+    const headers = {};
+    if (options.body !== undefined) headers['Content-Type'] = 'application/json';
+    if (state.pin) headers['X-Mobile-Pin'] = state.pin;
+    const response = await fetch(`/api/mobile${path}`, {
+      method: options.method || 'GET', headers,
+      body: options.body === undefined ? undefined : JSON.stringify(options.body)
+    });
+    const contentType = response.headers.get('Content-Type') || '';
+    if (!response.ok) {
+      const detail = contentType.includes('application/json') ? await response.json() : {};
+      if (response.status === 401 && state.pin) logout(detail.error || 'Mobile session expired. Sign in again.');
+      throw new Error(detail.error || 'Request failed.');
+    }
+    return contentType.includes('image/') ? response.blob() : response.json();
+  }
+  function message(text, error=false) { $('#status').textContent = text; $('#status').className = error ? 'error' : 'muted'; }
+  function logout(text='') {
+    state.qrRequest += 1;
+    if (state.qrUrl) URL.revokeObjectURL(state.qrUrl);
+    state.qrUrl = ''; state.pin = ''; $('#pin').value = '';
+    $('#app').hidden = true; $('#login').hidden = false; $('#login-error').textContent = text;
+  }
+  function total() {
+    const raw = state.cart.reduce((sum, item) => {
+      const gross = Math.round(item.qty * item.price * 100) / 100;
+      const discount = Math.round(gross * (item.discount_pct || 0)) / 100;
+      const taxable = gross - discount;
+      const tax = Math.round(taxable * item.tax_rate) / 100;
+      return sum + taxable + tax;
+    }, 0);
+    const cents = Math.round(raw * 100) / 100;
+    return state.settings.round_off ? Math.round(cents) : cents;
+  }
+  function paidNow() {
+    if (state.method === 'Credit') return 0;
+    if (state.part) return Math.round(Number($('#part-amount').value || 0) * 100) / 100;
+    return total();
+  }
+  function renderProducts() {
+    const query = $('#search').value.trim().toLowerCase();
+    const rows = state.products.filter(item => !query || `${item.name} ${item.sku} ${item.category}`.toLowerCase().includes(query)).slice(0, 60);
+    $('#products').innerHTML = rows.map(item => `<button type="button" class="product" data-item="${item.id}" ${!state.settings.allow_negative_stock && item.stock <= 0 ? 'disabled' : ''}>
+      <b>${esc(item.name)}</b><small>${esc(item.sku)} · ${money(item.price)}</small><small>${Number(item.stock).toLocaleString()} ${esc(item.unit)} in stock</small></button>`).join('') || '<p class="muted">No matching items.</p>';
+  }
+  async function renderQr() {
+    const wrap = $('#qr-wrap');
+    const amount = state.part ? paidNow() : total();
+    const requestId = ++state.qrRequest;
+    if (state.method !== 'UPI' || !state.settings.upi_id || amount <= 0) {
+      wrap.hidden = true;
+      if (state.qrUrl) URL.revokeObjectURL(state.qrUrl);
+      state.qrUrl = '';
+      return;
+    }
+    try {
+      const blob = await request(`/upi-qr?amount=${encodeURIComponent(amount.toFixed(2))}`);
+      if (requestId !== state.qrRequest) return;
+      if (state.qrUrl) URL.revokeObjectURL(state.qrUrl);
+      state.qrUrl = URL.createObjectURL(blob); $('#qr').src = state.qrUrl;
+      $('#qr-label').textContent = `Scan to pay ${money(amount)} to ${state.settings.upi_id}`;
+      wrap.hidden = false;
+    } catch (error) { message(error.message, true); }
+  }
+  function renderCart() {
+    $('#cart').innerHTML = state.cart.length ? state.cart.map((item,index) => `<div class="line">
+      <div><b>${esc(item.name)}</b><br><small>${money(item.price)} each</small></div>
+      <div class="steps"><button type="button" data-qty="minus" data-index="${index}" aria-label="Decrease ${esc(item.name)}">−</button>
+      <b>${item.qty}</b><button type="button" data-qty="plus" data-index="${index}" aria-label="Increase ${esc(item.name)}">+</button></div>
+      <label class="discount">Discount (%)<input type="number" min="0" max="100" step="0.01" inputmode="decimal" value="${item.discount_pct || ''}" data-discount="${index}"></label></div>`).join('') : '<p class="muted">Add an item to start a bill.</p>';
+    $('#total').textContent = money(total());
+    $('#part-toggle').hidden = state.method === 'Credit';
+    $('#part-toggle').classList.toggle('on', state.part);
+    $('#part-toggle').textContent = state.part ? 'Part payment on' : 'Record part payment';
+    $('#part-amount-wrap').hidden = !state.part;
+    $('#customer-required').hidden = state.method !== 'Credit' && !state.part;
+    $('#customer').required = state.method === 'Credit' || state.part;
+    $('#credit-note').hidden = state.method !== 'Credit' && !state.part;
+    $('#credit-note').textContent = state.method === 'Credit'
+      ? "The full bill amount will be added to this customer's pending balance."
+      : 'The unpaid balance will be added to this customer.';
+    $('#save').textContent = state.part && state.method !== 'Credit'
+      ? `Save bill (${money(paidNow())} received)` : `Save bill for ${money(total())}`;
+    document.querySelectorAll('[data-pay]').forEach(button => button.classList.toggle('on', button.dataset.pay === state.method));
+    renderQr();
+  }
+  function addItem(item) {
+    const line = state.cart.find(row => row.id === item.id);
+    if (line) line.qty += 1;
+    else state.cart.push({id:item.id,product_id:item.id,name:item.name,sku:item.sku,unit:item.unit,qty:1,price:item.price,discount_pct:0,tax_rate:item.tax_rate,stock:item.stock});
+    $('#search').value = ''; renderProducts(); renderCart(); message('');
+    $('#search').focus();
+  }
+  async function load() {
+    const [settings,products,customers] = await Promise.all([request('/settings'),request('/products'),request('/customers')]);
+    state.settings = settings; state.products = products; state.customers = customers;
+    $('#shop-name').textContent = settings.business_name || 'StockBill';
+    $('#customer').innerHTML = '<option value="">Walk-in customer</option>' + customers.map(customer =>
+      `<option value="${customer.id}">${esc(customer.name)}${customer.phone ? ` (${esc(customer.phone)})` : ''}</option>`).join('');
+    $('#customer').value = state.customer;
+    $('#app').hidden = false; $('#login').hidden = true;
+    renderProducts(); renderCart();
+  }
+  $('#login-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    $('#login-error').textContent = '';
+    try {
+      const response = await fetch('/api/mobile/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin:$('#pin').value})});
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || 'Sign-in failed.');
+      state.pin = $('#pin').value; await load();
+    } catch (error) { state.pin = ''; $('#login-error').textContent = error.message; }
+  });
+  $('#search').addEventListener('input', renderProducts);
+  $('#search').addEventListener('keydown', event => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    const query = event.currentTarget.value.trim().toLowerCase();
+    const matches = state.products.filter(item => item.active && item.sku.toLowerCase() === query);
+    if (matches.length === 1) addItem(matches[0]);
+    else message(matches.length ? 'Several items match; select the correct item.' : 'No exact SKU/barcode found.', true);
+  });
+  $('#products').addEventListener('click', event => {
+    const button = event.target.closest('[data-item]');
+    const item = state.products.find(row => row.id === Number(button && button.dataset.item));
+    if (item) addItem(item);
+  });
+  $('#cart').addEventListener('click', event => {
+    const button = event.target.closest('[data-qty]');
+    if (!button) return;
+    const item = state.cart[Number(button.dataset.index)];
+    if (!item) return;
+    if (button.dataset.qty === 'plus') {
+      if (!state.settings.allow_negative_stock && item.qty >= item.stock) return message(`Only ${item.stock} ${item.unit} of ${item.name} in stock.`, true);
+      item.qty += 1;
+    } else if (--item.qty <= 0) state.cart.splice(Number(button.dataset.index),1);
+    renderCart();
+  });
+  $('#cart').addEventListener('input', event => {
+    const input = event.target.closest('[data-discount]');
+    if (!input) return;
+    const item = state.cart[Number(input.dataset.discount)];
+    if (!item) return;
+    item.discount_pct = Math.max(0, Math.min(100, Number(input.value) || 0));
+    $('#total').textContent = money(total());
+    $('#save').textContent = state.part && state.method !== 'Credit'
+      ? `Save bill (${money(paidNow())} received)` : `Save bill for ${money(total())}`;
+    renderQr();
+  });
+  document.querySelectorAll('[data-pay]').forEach(button => button.addEventListener('click', () => {
+    state.method = button.dataset.pay;
+    if (state.method === 'Credit') state.part = false;
+    renderCart();
+  }));
+  $('#part-toggle').addEventListener('click', () => {
+    state.part = !state.part;
+    if (state.part) $('#part-amount').value = total().toFixed(2);
+    renderCart();
+  });
+  $('#part-amount').addEventListener('input', () => {
+    $('#save').textContent = `Save bill (${money(paidNow())} received)`;
+    renderQr();
+  });
+  $('#customer').addEventListener('change', event => { state.customer = event.target.value; });
+  $('#logout').addEventListener('click', () => logout());
+  $('#save').addEventListener('click', async event => {
+    if (!state.cart.length) return message('Add at least one item.', true);
+    if ((state.method === 'Credit' || state.part) && !state.customer) {
+      $('#customer').focus(); return message('Select a customer for credit or part payment.', true);
+    }
+    if (state.part && !(paidNow() > 0 && paidNow() <= total())) return message('Enter an amount above zero and no more than the bill total.', true);
+    const button = event.currentTarget; button.disabled = true;
+    try {
+      const amount = total();
+      const invoice = await request('/invoices',{method:'POST',body:{
+        customer_id:state.customer || null, paid:state.method === 'Credit' ? 0 : paidNow(),
+        payment_method:state.method, notes:$('#note').value,
+        items:state.cart.map(item => ({product_id:item.product_id,qty:item.qty,price:item.price,discount_pct:item.discount_pct || 0}))
+      }});
+      state.cart = []; state.customer = ''; state.part = false; $('#part-amount').value = ''; $('#note').value = ''; $('#customer').value = '';
+      await load(); message(`Saved ${invoice.number} for ${money(invoice.grand_total)}.`);
+    } catch (error) { message(error.message, true); }
+    finally { button.disabled = false; }
+  });
+  fetch('/api/mobile/login').then(response => response.json()).then(info => {
+    if (!info.pin_enabled) {
+      $('#login-help').textContent = 'Mobile billing is disabled. Set a separate mobile PIN in the main app Settings.';
+      $('#login-form').hidden = true;
+    } else $('#pin').focus();
+  }).catch(() => { $('#login-error').textContent = "Can't reach StockBill. Check the server and Wi-Fi connection."; });
+})();
+</script></body></html>"""
 
 if __name__ == "__main__":
     main()
