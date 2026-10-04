@@ -529,9 +529,12 @@ class Store:
             name = text(p.get("name"), 120)
             if not name:
                 raise ApiError(400, "Customer name is required")
+            phone = text(p.get("phone"), 20)
+            if not phone:
+                raise ApiError(400, "Customer phone number is required")
             fields = {
                 "name": name,
-                "phone": text(p.get("phone"), 20),
+                "phone": phone,
                 "email": text(p.get("email"), 120),
                 "address": text(p.get("address"), 300),
                 "gstin": text(p.get("gstin"), 20),
@@ -627,6 +630,10 @@ class Store:
             customer = None
             if p.get("customer_id"):
                 customer = self._find("customers", to_int(p["customer_id"], "Customer"), "Customer")
+            if customer is None:
+                raise ApiError(400, "Choose a customer with a phone number for every bill")
+            if not text(customer.get("phone"), 20):
+                raise ApiError(400, "Add a phone number to this customer before creating a bill")
 
             # 1) validate and price every line (nothing is changed yet)
             lines, need = [], {}
@@ -642,6 +649,8 @@ class Store:
                     raise ApiError(400, f"Quantity for {prod['name']} must be more than zero")
                 price = money(dec(li.get("price"), "Price", Decimal(str(prod["price"]))))
                 pct = dec(li.get("discount_pct"), "Discount", Decimal(0))
+                if pct != 0:
+                    raise ApiError(400, "Discounts cannot be changed while billing")
                 if price < 0:
                     raise ApiError(400, "Price cannot be negative")
                 if not 0 <= pct <= 100:
@@ -684,8 +693,6 @@ class Store:
             if mobile and p.get("payment_method") in ("Cash", "UPI") and grand > 0 and paid == 0:
                 raise ApiError(400, "Use Credit for a transaction with no upfront payment")
             paid = min(paid, grand)
-            if paid < grand and customer is None:
-                raise ApiError(400, "Choose a customer when the bill is not fully paid")
             method = p.get("payment_method") if p.get("payment_method") in PAY_METHODS else "Cash"
 
             # 4) apply
@@ -697,10 +704,10 @@ class Store:
                 "date": stamp,
                 "customer_id": customer["id"] if customer else None,
                 "customer": {
-                    "name": customer["name"] if customer else "Walk-in customer",
-                    "phone": customer["phone"] if customer else "",
-                    "address": customer["address"] if customer else "",
-                    "gstin": customer["gstin"] if customer else "",
+                    "name": customer["name"],
+                    "phone": customer["phone"],
+                    "address": customer["address"],
+                    "gstin": customer["gstin"],
                 },
                 "items": lines,
                 "subtotal": float(gross_t),
@@ -1361,16 +1368,15 @@ def make_handler(store, pin):
 # --------------------------------------------------------------------------- #
 DEMO_ITEMS = [
     # name, category, unit, price, cost, tax %, stock, low-stock alert
-    ("Basmati rice 5 kg", "Grocery", "pack", 640, 560, 5, 24, 8),
-    ("Toor dal 1 kg", "Grocery", "pack", 165, 142, 5, 40, 10),
-    ("Sunflower oil 1 L", "Grocery", "btl", 149, 128, 5, 30, 10),
-    ("Loose sugar", "Grocery", "kg", 46, 40, 5, 60, 15),
-    ("Masala tea 250 g", "Beverages", "pack", 130, 98, 5, 18, 6),
-    ("Bath soap", "Personal care", "pcs", 38, 29, 18, 5, 12),
-    ("Shampoo sachet", "Personal care", "pcs", 2, 1.4, 18, 300, 100),
-    ("Notebook A5", "Stationery", "pcs", 60, 42, 12, 45, 10),
-    ("Ball pen (blue)", "Stationery", "pcs", 10, 6, 12, 120, 30),
-    ("LED bulb 9 W", "Electrical", "pcs", 99, 70, 18, 0, 5),
+    ("NPK 19:19:19 water-soluble fertilizer 1 kg", "Fertilizer", "pack", 420, 340, 5, 35, 8),
+    ("Urea fertilizer 45 kg", "Fertilizer", "bag", 270, 240, 5, 20, 5),
+    ("DAP fertilizer 50 kg", "Fertilizer", "bag", 1350, 1200, 5, 16, 4),
+    ("Organic compost 5 kg", "Fertilizer", "bag", 180, 130, 5, 42, 10),
+    ("Micronutrient mixture 1 kg", "Fertilizer", "pack", 260, 195, 5, 28, 6),
+    ("Neem-based insecticide 1 L", "Pesticide", "btl", 350, 245, 18, 24, 6),
+    ("Imidacloprid 17.8% SL 100 ml", "Pesticide", "btl", 190, 132, 18, 30, 8),
+    ("Mancozeb 75% WP 500 g", "Pesticide", "pack", 240, 170, 18, 26, 6),
+    ("Glyphosate 41% SL 1 L", "Pesticide", "btl", 520, 390, 18, 18, 5),
 ]
 
 
@@ -1380,8 +1386,8 @@ def seed_demo(store):
     for name, cat, unit, price, cost, tax, stock, low in DEMO_ITEMS:
         store.save_product({"name": name, "category": cat, "unit": unit, "price": price, "cost": cost,
                             "tax_rate": tax, "stock": stock, "low_stock": low})
-    store.save_customer({"name": "Sharma General Store", "phone": "9811000001", "address": "Karol Bagh, New Delhi"})
-    store.save_customer({"name": "Anita Verma", "phone": "9811000002"})
+    store.save_customer({"name": "Green Fields Farm", "phone": "9811000001"})
+    store.save_customer({"name": "Agri Test Customer", "phone": "9811000002"})
 
 
 class Server(ThreadingHTTPServer):
@@ -1611,8 +1617,6 @@ button.mini{all:unset;box-sizing:border-box;display:flex;justify-content:space-b
 .stepper button:hover{background:var(--line)}
 .stepper input{border:0;border-radius:0;width:58px;text-align:center;min-height:38px;padding:4px}
 .l-mid .price{width:84px}
-.disc{display:flex;align-items:center;gap:4px;font-size:13px;color:var(--muted)}
-.disc input{width:56px;min-height:38px;padding:4px 8px}
 .l-total{margin-left:auto;font-weight:800}
 .l-sub{font-size:13px}
 .totals{margin:6px 0 0;padding-top:10px;border-top:1px dashed var(--line);display:flex;flex-direction:column;gap:5px}
@@ -1769,7 +1773,10 @@ const S = {
   invStatus: 'all', invCustomer: '', current: null, focusPos: false,
   financialYear: '', financialYears: []
 };
-try { S.cart = JSON.parse(localStorage.getItem('sb_cart') || '[]'); } catch (_) { S.cart = []; }
+try {
+  S.cart = JSON.parse(localStorage.getItem('sb_cart') || '[]');
+  S.cart.forEach(line => { delete line.disc; });
+} catch (_) { S.cart = []; }
 const saveCart = () => { try { localStorage.setItem('sb_cart', JSON.stringify(S.cart)); } catch (_) {} };
 
 /* ---------- formatting ---------- */
@@ -2227,7 +2234,7 @@ function addToCart(pid) {
     add = Math.min(1, left);
   }
   if (line) line.qty = Math.round((line.qty + add) * 1000) / 1000;
-  else S.cart.push({product_id: p.id, name: p.name, sku: p.sku, unit: p.unit, qty: add, price: p.price, disc: 0, tax_rate: p.tax_rate, stock: p.stock});
+  else S.cart.push({product_id: p.id, name: p.name, sku: p.sku, unit: p.unit, qty: add, price: p.price, tax_rate: p.tax_rate, stock: p.stock});
   saveCart(); renderBill(); renderNav();
   if (window.matchMedia('(max-width:1000px)').matches) toast(`Added ${p.name}`, 'ok');
 }
@@ -2240,19 +2247,19 @@ function clampQty(l) {
   if (!S.settings.allow_negative_stock && l.qty > l.stock) { l.qty = l.stock; toast(`Only ${fmtQty(l.stock)} ${l.unit} of ${l.name} in stock`, 'err'); }
 }
 function calcCart() {
-  let gross = 0, disc = 0, taxable = 0, tax = 0;
+  let gross = 0, taxable = 0, tax = 0;
   const lines = S.cart.map(l => {
-    const g = r2(l.qty * l.price), d = r2(g * (l.disc || 0) / 100), tb = r2(g - d), t = r2(tb * l.tax_rate / 100);
-    gross += g; disc += d; taxable += tb; tax += t; return r2(tb + t);
+    const g = r2(l.qty * l.price), t = r2(g * l.tax_rate / 100);
+    gross += g; taxable += g; tax += t; return r2(g + t);
   });
   const raw = r2(taxable + tax);
   const grand = S.settings.round_off ? Math.round(raw) : raw;
-  return {lines, gross: r2(gross), disc: r2(disc), tax: r2(tax), round: r2(grand - raw), grand};
+  return {lines, gross: r2(gross), tax: r2(tax), round: r2(grand - raw), grand};
 }
 function renderBill() {
   const el = $('#bill'); if (!el) return;
   const c = calcCart(), cur = S.pay;
-  const custOpts = '<option value="">Walk-in customer</option>' + S.customers.map(x =>
+  const custOpts = '<option value="">Select customer</option>' + S.customers.map(x =>
     `<option value="${x.id}" ${String(x.id) === String(S.cartCustomer) ? 'selected' : ''}>${esc(x.name)}${x.phone ? ' (' + esc(x.phone) + ')' : ''}</option>`).join('');
   const lines = S.cart.map((l, i) => `<div class="line">
       <div class="l-top"><b>${esc(l.name)}</b><button class="icon-btn" data-act="rm-line" data-i="${i}" aria-label="Remove ${esc(l.name)}">${ic('x')}</button></div>
@@ -2261,18 +2268,16 @@ function renderBill() {
           <input class="num" inputmode="decimal" data-in="qty" data-i="${i}" value="${l.qty}" aria-label="Quantity"><button data-act="inc" data-i="${i}" aria-label="More">+</button></div>
         <span class="muted">at</span>
         <input class="price num" inputmode="decimal" data-in="price" data-i="${i}" value="${l.price}" aria-label="Price per ${esc(l.unit)}">
-        <label class="disc"><input class="num" inputmode="decimal" data-in="disc" data-i="${i}" value="${l.disc || ''}" placeholder="0" aria-label="Discount percent">% off</label>
         <b class="l-total num" id="lt-${i}">${fmtMoney(c.lines[i])}</b></div>
       <div class="l-sub muted">per ${esc(l.unit)}, tax ${l.tax_rate}% added</div></div>`).join('');
   el.innerHTML = `<div class="receipt">
     <div class="rc-head"><h2>Current bill</h2>${S.cart.length ? '<button class="link" data-act="clear-cart">Clear all</button>' : ''}</div>
-    <div class="custbar"><label class="f"><span>Customer${S.pay.mode === 'credit' || S.pay.mode === 'part' ? ' (required)' : ''}</span>
-      <select data-ch="cust" aria-label="Customer" ${S.pay.mode === 'credit' || S.pay.mode === 'part' ? 'required' : ''}>${custOpts}</select></label>
+    <div class="custbar"><label class="f"><span>Customer (required for every bill)</span>
+      <select data-ch="cust" aria-label="Customer" required>${custOpts}</select></label>
       <button class="btn ghost sm" data-act="new-cust">${ic('plus')} New</button></div>
     <div class="lines">${S.cart.length ? lines : '<p class="empty">Tap an item to add it to the bill.</p>'}</div>
     ${S.cart.length ? `<dl class="totals num">
       <div><dt>Subtotal</dt><dd id="t-gross">${fmtMoney(c.gross)}</dd></div>
-      <div><dt>Discount</dt><dd id="t-disc">&minus;${fmtMoney(c.disc)}</dd></div>
       <div><dt>Tax</dt><dd id="t-tax">${fmtMoney(c.tax)}</dd></div>
       ${S.settings.round_off ? `<div><dt>Round off</dt><dd id="t-round">${fmtMoney(c.round)}</dd></div>` : ''}
       <div class="grand"><dt>Total</dt><dd id="t-grand">${fmtMoney(c.grand)}</dd></div></dl>
@@ -2301,7 +2306,7 @@ function renderBill() {
 function refreshTotals() {
   const c = calcCart(), set = (id, v) => { const e = $('#' + id); if (e) e.textContent = v; };
   c.lines.forEach((v, i) => set('lt-' + i, fmtMoney(v)));
-  set('t-gross', fmtMoney(c.gross)); set('t-disc', '\u2212' + fmtMoney(c.disc)); set('t-tax', fmtMoney(c.tax));
+  set('t-gross', fmtMoney(c.gross)); set('t-tax', fmtMoney(c.tax));
   set('t-round', fmtMoney(c.round)); set('t-grand', fmtMoney(c.grand)); set('save-btn', 'Save bill for ' + fmtMoney(c.grand));
   if (S.pay.method === 'UPI' && S.pay.mode !== 'credit') {
     refreshUpiQr(S.pay.mode === 'part' ? num(S.pay.amount) : c.grand);
@@ -2311,9 +2316,9 @@ function refreshTotals() {
     if (amount) amount.textContent = `Scan to pay ${fmtMoney(S.pay.mode === 'part' ? num(S.pay.amount) : c.grand)}`;
   }
 }
-const lineInput = key => (el, e) => { const l = S.cart[+el.dataset.i]; if (!l) return; l[key] = Math.max(0, num(el.value)); if (key === 'disc') l.disc = Math.min(100, l.disc); saveCart(); refreshTotals(); };
+const lineInput = key => (el, e) => { const l = S.cart[+el.dataset.i]; if (!l) return; l[key] = Math.max(0, num(el.value)); saveCart(); refreshTotals(); };
 inputs.qty = (el, e) => { const l = S.cart[+el.dataset.i]; if (!l) return; l.qty = Math.max(0, num(el.value)); clampQty(l); saveCart(); refreshTotals(); };
-inputs.price = lineInput('price'); inputs.disc = lineInput('disc');
+inputs.price = lineInput('price');
 inputs.paid = el => { S.pay.amount = el.value; refreshUpiQr(num(S.pay.amount)); };
 inputs.notes = el => { S.pay.notes = el.value; };
 changes.cust = el => { S.cartCustomer = el.value; };
@@ -2332,18 +2337,19 @@ actions['new-cust'] = () => customerForm(null, true);
 actions['save-bill'] = async el => {
   if (!S.cart.length) return toast('Add at least one item', 'err');
   if (S.cart.some(l => !(l.qty > 0))) return toast('Every item needs a quantity above zero', 'err');
-  const c = calcCart();
-  const paid = S.pay.mode === 'full' ? c.grand : (S.pay.mode === 'credit' ? 0 : num(S.pay.amount));
-  if (paid < c.grand && !S.cartCustomer) {
-    toast('Choose a customer for credit or part payment', 'err');
+  const customer = S.customers.find(c => String(c.id) === String(S.cartCustomer));
+  if (!customer || !customer.phone) {
+    toast('Choose a customer with a phone number for every bill', 'err');
     $('[data-ch="cust"]')?.focus();
     return;
   }
+  const c = calcCart();
+  const paid = S.pay.mode === 'full' ? c.grand : (S.pay.mode === 'credit' ? 0 : num(S.pay.amount));
   el.disabled = true;
   try {
     const inv = await api('/invoices', {method: 'POST', body: {
       customer_id: S.cartCustomer || null, paid, payment_method: S.pay.method, notes: S.pay.notes,
-      items: S.cart.map(l => ({product_id: l.product_id, qty: l.qty, price: l.price, discount_pct: l.disc || 0}))}});
+      items: S.cart.map(l => ({product_id: l.product_id, qty: l.qty, price: l.price}))}});
     S.cart = []; S.cartCustomer = ''; S.pay = {mode: 'full', amount: '', method: 'Cash', notes: ''}; S.billTab = 'items'; saveCart();
     await Promise.all([refreshProducts(), refreshCustomers()]);
     toast(`Saved ${inv.number}`, 'ok');
@@ -2448,7 +2454,7 @@ function customerForm(c, fromBill = false) {
   const isNew = !c; c = c || {name: '', phone: '', email: '', address: '', gstin: ''};
   openModal(isNew ? 'Add customer' : 'Edit customer', `<form data-form="customer" class="stack"><input type="hidden" name="id" value="${c.id || ''}"><input type="hidden" name="from_bill" value="${fromBill ? '1' : ''}">
     ${field('Name', 'name', c.name, 'required autofocus maxlength="120"')}
-    <div class="two">${field('Phone', 'phone', c.phone, 'type="tel" inputmode="tel"')}${field('Email', 'email', c.email, 'type="email"')}</div>
+    <div class="two">    ${field('Phone', 'phone', c.phone, 'required type="tel" inputmode="tel"')}${field('Email', 'email', c.email, 'type="email"')}</div>
     ${field('Address', 'address', c.address)}${field('GSTIN (optional)', 'gstin', c.gstin, 'maxlength="20"')}
     <div class="dlg-actions"><button class="btn">Save customer</button><button type="button" class="btn ghost" data-act="close">Cancel</button>
       ${isNew ? '' : `<button type="button" class="btn danger push" data-act="del-customer" data-id="${c.id}">Delete</button>`}</div></form>`);
@@ -2749,7 +2755,6 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.product,.line{border:1px solid #e0e7e4;border-radius:9px;padding:11px;background:white;color:inherit;text-align:left}
 .product{display:flex;flex-direction:column;gap:4px;min-height:92px}.product:disabled{opacity:.5}.product small,.line small{color:#687b7f}
 .line{display:grid;grid-template-columns:1fr auto;gap:7px;margin-bottom:8px}.steps{display:flex;align-items:center;gap:8px}.steps button{min-width:42px;padding:6px}.steps b{min-width:26px;text-align:center}
-.discount{grid-column:1/-1;max-width:160px}
 .chips{display:flex;gap:8px}.chips button{flex:1;background:#eef3f1;color:#18343b;border:1px solid #d4dedb}.chips button.on{background:#14303a;color:white}
 .total{display:flex;justify-content:space-between;padding:10px 0;font-weight:800;font-size:18px;border-top:1px solid #e0e7e4}
 .primary{width:100%;background:#f2a900;color:#18343b}.notice{padding:10px;background:#fff1d6;border-radius:8px}.error{color:#a52828}.qr{display:flex;align-items:center;gap:12px}.qr img{width:120px;height:120px}
@@ -2773,7 +2778,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
     </section>
     <section class="card stack">
       <h2>Current bill</h2>
-      <label class="stack"><span>Customer <b id="customer-required" hidden>(required for credit or part payment)</b></span><select id="customer"></select></label>
+      <label class="stack"><span>Customer (required for every bill)</span><select id="customer" required></select></label>
       <div id="cart"></div>
       <div class="total"><span>Total</span><span id="total"></span></div>
       <div class="chips" role="group" aria-label="Payment method">
@@ -2823,8 +2828,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
   function total() {
     const raw = state.cart.reduce((sum, item) => {
       const gross = Math.round(item.qty * item.price * 100) / 100;
-      const discount = Math.round(gross * (item.discount_pct || 0)) / 100;
-      const taxable = gross - discount;
+      const taxable = gross;
       const tax = Math.round(taxable * item.tax_rate) / 100;
       return sum + taxable + tax;
     }, 0);
@@ -2866,14 +2870,13 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
       <div><b>${esc(item.name)}</b><br><small>${money(item.price)} each</small></div>
       <div class="steps"><button type="button" data-qty="minus" data-index="${index}" aria-label="Decrease ${esc(item.name)}">−</button>
       <b>${item.qty}</b><button type="button" data-qty="plus" data-index="${index}" aria-label="Increase ${esc(item.name)}">+</button></div>
-      <label class="discount">Discount (%)<input type="number" min="0" max="100" step="0.01" inputmode="decimal" value="${item.discount_pct || ''}" data-discount="${index}"></label></div>`).join('') : '<p class="muted">Add an item to start a bill.</p>';
+      </div>`).join('') : '<p class="muted">Add an item to start a bill.</p>';
     $('#total').textContent = money(total());
     $('#part-toggle').hidden = state.method === 'Credit';
     $('#part-toggle').classList.toggle('on', state.part);
     $('#part-toggle').textContent = state.part ? 'Part payment on' : 'Record part payment';
     $('#part-amount-wrap').hidden = !state.part;
-    $('#customer-required').hidden = state.method !== 'Credit' && !state.part;
-    $('#customer').required = state.method === 'Credit' || state.part;
+    $('#customer').required = true;
     $('#credit-note').hidden = state.method !== 'Credit' && !state.part;
     $('#credit-note').textContent = state.method === 'Credit'
       ? "The full bill amount will be added to this customer's pending balance."
@@ -2886,7 +2889,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
   function addItem(item) {
     const line = state.cart.find(row => row.id === item.id);
     if (line) line.qty += 1;
-    else state.cart.push({id:item.id,product_id:item.id,name:item.name,sku:item.sku,unit:item.unit,qty:1,price:item.price,discount_pct:0,tax_rate:item.tax_rate,stock:item.stock});
+    else state.cart.push({id:item.id,product_id:item.id,name:item.name,sku:item.sku,unit:item.unit,qty:1,price:item.price,tax_rate:item.tax_rate,stock:item.stock});
     $('#search').value = ''; renderProducts(); renderCart(); message('');
     $('#search').focus();
   }
@@ -2894,7 +2897,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
     const [settings,products,customers] = await Promise.all([request('/settings'),request('/products'),request('/customers')]);
     state.settings = settings; state.products = products; state.customers = customers;
     $('#shop-name').textContent = settings.business_name || 'StockBill';
-    $('#customer').innerHTML = '<option value="">Walk-in customer</option>' + customers.map(customer =>
+    $('#customer').innerHTML = '<option value="">Select customer</option>' + customers.map(customer =>
       `<option value="${customer.id}">${esc(customer.name)}${customer.phone ? ` (${esc(customer.phone)})` : ''}</option>`).join('');
     $('#customer').value = state.customer;
     $('#app').hidden = false; $('#login').hidden = true;
@@ -2935,17 +2938,6 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
     } else if (--item.qty <= 0) state.cart.splice(Number(button.dataset.index),1);
     renderCart();
   });
-  $('#cart').addEventListener('input', event => {
-    const input = event.target.closest('[data-discount]');
-    if (!input) return;
-    const item = state.cart[Number(input.dataset.discount)];
-    if (!item) return;
-    item.discount_pct = Math.max(0, Math.min(100, Number(input.value) || 0));
-    $('#total').textContent = money(total());
-    $('#save').textContent = state.part && state.method !== 'Credit'
-      ? `Save bill (${money(paidNow())} received)` : `Save bill for ${money(total())}`;
-    renderQr();
-  });
   document.querySelectorAll('[data-pay]').forEach(button => button.addEventListener('click', () => {
     state.method = button.dataset.pay;
     if (state.method === 'Credit') state.part = false;
@@ -2964,8 +2956,9 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
   $('#logout').addEventListener('click', () => logout());
   $('#save').addEventListener('click', async event => {
     if (!state.cart.length) return message('Add at least one item.', true);
-    if ((state.method === 'Credit' || state.part) && !state.customer) {
-      $('#customer').focus(); return message('Select a customer for credit or part payment.', true);
+    const customer = state.customers.find(row => String(row.id) === String(state.customer));
+    if (!customer || !customer.phone) {
+      $('#customer').focus(); return message('Select a customer with a phone number for every bill.', true);
     }
     if (state.part && !(paidNow() > 0 && paidNow() <= total())) return message('Enter an amount above zero and no more than the bill total.', true);
     const button = event.currentTarget; button.disabled = true;
@@ -2974,7 +2967,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
       const invoice = await request('/invoices',{method:'POST',body:{
         customer_id:state.customer || null, paid:state.method === 'Credit' ? 0 : paidNow(),
         payment_method:state.method, notes:$('#note').value,
-        items:state.cart.map(item => ({product_id:item.product_id,qty:item.qty,price:item.price,discount_pct:item.discount_pct || 0}))
+        items:state.cart.map(item => ({product_id:item.product_id,qty:item.qty,price:item.price}))
       }});
       state.cart = []; state.customer = ''; state.part = false; $('#part-amount').value = ''; $('#note').value = ''; $('#customer').value = '';
       await load(); message(`Saved ${invoice.number} for ${money(invoice.grand_total)}.`);
