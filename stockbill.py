@@ -1636,6 +1636,15 @@ button.mini{all:unset;box-sizing:border-box;display:flex;justify-content:space-b
 .totals .grand{font-size:22px;font-weight:800;padding-top:8px;border-top:2px solid var(--ink);margin-top:6px}
 .totals .grand dt{color:var(--text)}
 .pay{display:flex;flex-direction:column;gap:10px;margin:14px 0}
+.settings-layout{display:grid;grid-template-columns:220px minmax(0,1fr);gap:18px;align-items:start}
+.settings-menu{display:flex;flex-direction:column;gap:5px;padding:8px;background:#fff;border:1px solid var(--line);border-radius:12px;position:sticky;top:16px}
+.settings-menu button{all:unset;box-sizing:border-box;display:flex;align-items:center;gap:10px;min-height:44px;padding:9px 12px;border-radius:8px;cursor:pointer;font-weight:650;color:var(--muted)}
+.settings-menu button:hover{background:var(--line-2);color:var(--text)}
+.settings-menu button.active{background:var(--ink);color:#fff}
+.settings-menu button:focus-visible{outline:3px solid #7CC4BB}
+.settings-content{min-width:0}
+.settings-content>.settings-pane>.card{max-width:900px}
+.settings-pane[hidden]{display:none}
 
 /* dialog */
 dialog{border:0;border-radius:14px;padding:0;width:min(520px,94vw);max-height:92vh;box-shadow:0 24px 70px rgba(10,30,36,.4);color:var(--text);background:#fff}
@@ -1714,6 +1723,10 @@ dialog::backdrop{background:rgba(10,30,36,.55)}
   .two{grid-template-columns:1fr 1fr}
   .tile b{font-size:21px}
   main.transaction-main{padding:14px 10px calc(96px + env(safe-area-inset-bottom))}
+  .settings-layout{grid-template-columns:1fr;gap:12px}
+  .settings-menu{position:static;flex-direction:row;overflow-x:auto;gap:4px;padding:5px;scrollbar-width:thin}
+  .settings-menu button{flex:0 0 auto;min-height:40px;padding:8px 11px;white-space:nowrap}
+  .settings-content>.settings-pane>.card{max-width:none}
   .pos-grid{grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:7px}
   .upi-qr{align-items:flex-start;gap:10px;padding:10px}
   .upi-qr img{width:116px;height:116px;flex-basis:116px}
@@ -1778,7 +1791,7 @@ const S = {
   cart: [], cartCustomer: '', pay: {mode: 'full', amount: '', method: 'Cash', notes: ''},
   posQuery: '', q: {products: '', customers: '', invoices: '', expenses: ''}, lowOnly: false, archived: false,
   invStatus: 'all', invCustomer: '', current: null, focusPos: false,
-  financialYear: '', financialYears: []
+  financialYear: '', financialYears: [], settingsSection: 'shop'
 };
 try {
   S.cart = JSON.parse(localStorage.getItem('sb_cart') || '[]');
@@ -2595,21 +2608,41 @@ actions['void-inv'] = async () => {
 /* ================= SETTINGS ================= */
 async function vSettings() {
   const s = S.settings, i = S.info;
+  const sections = [
+    ['shop', 'Shop details'],
+    ['billing', 'Billing & tax'],
+    ['security', 'Security'],
+    ['mobile', 'Mobile access'],
+    ['data', 'Data & integrations']
+  ];
   return `<header class="page-head"><h1>Settings</h1></header>
-    <div class="grid2">
+    <div class="settings-layout">
+      <nav class="settings-menu" aria-label="Settings sections">
+        ${sections.map(([id, label]) => `<button type="button" data-act="settings-section" data-settings="${id}" ${S.settingsSection === id ? 'class="active" aria-current="page"' : ''}>${label}</button>`).join('')}
+      </nav>
+      <div class="settings-content">
+    <section class="settings-pane" data-settings-pane="shop" ${S.settingsSection !== 'shop' ? 'hidden' : ''}>
     <form class="card stack" data-form="settings"><h2>Shop details</h2>
-      ${field('Shop name', 'business_name', s.business_name, 'required')}${field('Address', 'address', s.address)}
-      <div class="two">${field('Phone', 'phone', s.phone, 'type="tel"')}${field('UPI ID', 'upi_id', s.upi_id || '', 'maxlength="164" placeholder="name@bank"')}</div>
-      ${field('Credit interest (% per month)', 'credit_interest_monthly', s.credit_interest_monthly || 0, 'type="number" inputmode="decimal" min="0" max="100" step="0.01" required')}
-      <p class="muted">Simple interest is added monthly on unpaid bill principal. Payments reduce principal first; interest does not compound. This rate applies to existing unpaid credit bills from their invoice dates as well as new credit bills.</p>
+      ${field('Shop name', 'business_name', s.business_name, 'required')}
+      ${field('Address', 'address', s.address)}
+      ${field('Phone', 'phone', s.phone, 'type="tel"')}
       ${field('GSTIN', 'gstin', s.gstin)}
       <div class="two">${field('Currency symbol', 'currency', s.currency, 'maxlength="4"')}${field('Invoice number prefix', 'invoice_prefix', s.invoice_prefix, 'maxlength="12"')}</div>
       ${field('Country code for WhatsApp', 'country_code', s.country_code, 'inputmode="numeric" maxlength="4"')}
       ${field('Message at the bottom of invoices', 'footer_note', s.footer_note)}
+      <button class="btn">Save shop details</button></form>
+    </section>
+    <section class="settings-pane" data-settings-pane="billing" ${S.settingsSection !== 'billing' ? 'hidden' : ''}>
+    <form class="card stack" data-form="settings"><h2>Billing & tax</h2>
+      ${field('UPI ID', 'upi_id', s.upi_id || '', 'maxlength="164" placeholder="name@bank"')}
+      ${field('Credit interest (% per month)', 'credit_interest_monthly', s.credit_interest_monthly || 0, 'type="number" inputmode="decimal" min="0" max="100" step="0.01" required')}
+      <p class="muted">Simple interest is added monthly on unpaid bill principal. Payments reduce principal first; interest does not compound. This rate applies to existing unpaid credit bills from their invoice dates as well as new credit bills.</p>
       <label class="check"><input type="checkbox" name="round_off" ${s.round_off ? 'checked' : ''}> Round bill totals to the nearest whole amount</label>
       <label class="check"><input type="checkbox" name="allow_negative_stock" ${s.allow_negative_stock ? 'checked' : ''}> Allow billing items that are out of stock</label>
-      <button class="btn">Save settings</button></form>
-    <div class="stack"><div class="card stack"><h2>Change PIN</h2>
+      <button class="btn">Save billing settings</button></form>
+    </section>
+    <section class="settings-pane stack" data-settings-pane="security" ${S.settingsSection !== 'security' ? 'hidden' : ''}>
+    <div class="card stack"><h2>Change PIN</h2>
       <p class="muted">${i.pin_enabled ? 'Enter your current PIN and choose a new one.' : 'Set a PIN to require sign-in each time the app opens.'} Use 4 to 12 digits.</p>
       <form class="stack" data-form="pin">
         ${i.pin_enabled ? field('Current PIN', 'current_pin', '', 'type="password" inputmode="numeric" autocomplete="current-password" required') : '<input type="hidden" name="current_pin" value="">'}
@@ -2617,6 +2650,8 @@ async function vSettings() {
         ${field('Confirm new PIN', 'confirm_pin', '', 'type="password" inputmode="numeric" autocomplete="new-password" minlength="4" maxlength="12" pattern="[0-9]{4,12}" required')}
         <button class="btn">Save PIN</button>
       </form></div>
+    </section>
+    <section class="settings-pane stack" data-settings-pane="mobile" ${S.settingsSection !== 'mobile' ? 'hidden' : ''}>
     <div class="card stack"><h2>Mobile billing access</h2>
       <p class="muted">${i.mobile_pin_enabled ? 'Mobile billing is protected by its own PIN.' : 'Set a separate PIN to enable the billing-only mobile page.'} Use 4 to 12 digits, different from the shop PIN.</p>
       <form class="stack" data-form="mobile-pin">
@@ -2627,6 +2662,11 @@ async function vSettings() {
       ${i.mobile_pin_enabled ? '<button class="btn danger" data-act="disable-mobile-billing">Disable mobile billing</button>' : ''}
       ${i.lan_url ? `<p>On the same Wi-Fi, open <b style="overflow-wrap:anywhere">${esc(i.lan_url)}/mobile</b> on the phone.</p>` : '<p class="muted">Start StockBill on your Wi-Fi interface to access the mobile page from another device.</p>'}
       <p class="muted">This page only supports billing; its PIN cannot access the main app APIs. Use only on a trusted private Wi-Fi network: HTTP does not encrypt the PIN or transaction data. Camera scanning requires HTTPS, so on this HTTP page use search, type a SKU/barcode, or connect a keyboard-style scanner.</p></div>
+    <div class="card stack"><h2>Use on your phone</h2>
+      ${i.lan_url ? `<p>On the same Wi-Fi, open <b style="overflow-wrap:anywhere">${esc(i.lan_url)}</b> in your phone's browser, then use "Add to Home screen".</p>` : '<p class="muted">The server was started for this computer only. Restart without <code>--host 127.0.0.1</code> to use it on a phone.</p>'}
+      <p class="muted">${i.pin_enabled ? 'A PIN is required to open the app. PIN changes are saved and will remain active after restart.' : 'No PIN is set. Anyone on your Wi-Fi can open this. Set one above to lock the app.'}</p></div>
+    </section>
+    <section class="settings-pane stack" data-settings-pane="data" ${S.settingsSection !== 'data' ? 'hidden' : ''}>
     <div class="card stack"><h2>Your data</h2>
       <p class="muted">Everything is stored in one JSON file on the computer running StockBill. A copy is also kept each day in a backups folder next to it.</p>
       <p style="overflow-wrap:anywhere"><b>Data file:</b> ${esc(i.data_file || '')}</p>
@@ -2634,13 +2674,26 @@ async function vSettings() {
     <div class="card stack"><h2>WhatsApp Web</h2>
       <p class="muted">Link this browser using WhatsApp's official QR code. Open WhatsApp Web, scan the QR code with WhatsApp on your phone, then use the reminder links on customer and invoice bills. Messages open as drafts for you to review and send.</p>
       <p><a class="btn ghost" href="https://web.whatsapp.com/" target="_blank" rel="noopener noreferrer">Open WhatsApp Web to scan QR</a></p></div>
-    <div class="card stack"><h2>Use on your phone</h2>
-      ${i.lan_url ? `<p>On the same Wi-Fi, open <b style="overflow-wrap:anywhere">${esc(i.lan_url)}</b> in your phone's browser, then use "Add to Home screen".</p>` : '<p class="muted">The server was started for this computer only. Restart without <code>--host 127.0.0.1</code> to use it on a phone.</p>'}
-      <p class="muted">${i.pin_enabled ? 'A PIN is required to open the app. PIN changes are saved and will remain active after restart.' : 'No PIN is set. Anyone on your Wi-Fi can open this. Set one above to lock the app.'}</p></div></div></div>`;
+    </section>
+      </div>
+    </div>`;
 }
+actions['settings-section'] = el => {
+  S.settingsSection = el.dataset.settings;
+  $$('.settings-menu button').forEach(button => {
+    const active = button.dataset.settings === S.settingsSection;
+    button.classList.toggle('active', active);
+    if (active) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  });
+  $$('.settings-pane').forEach(pane => {
+    pane.hidden = pane.dataset.settingsPane !== S.settingsSection;
+  });
+};
 forms.settings = async f => {
   const fd = new FormData(f), d = Object.fromEntries(fd);
-  d.round_off = fd.has('round_off'); d.allow_negative_stock = fd.has('allow_negative_stock');
+  if (f.elements.namedItem('round_off')) d.round_off = fd.has('round_off');
+  if (f.elements.namedItem('allow_negative_stock')) d.allow_negative_stock = fd.has('allow_negative_stock');
   S.settings = await api('/settings', {method: 'PUT', body: d});
   document.title = S.settings.business_name + ' | StockBill'; renderNav(); toast('Settings saved', 'ok');
 };
