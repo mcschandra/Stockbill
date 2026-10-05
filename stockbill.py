@@ -650,7 +650,7 @@ class Store:
                 qty = qty_round(dec(li.get("qty"), "Quantity"))
                 if qty <= 0:
                     raise ApiError(400, f"Quantity for {prod['name']} must be more than zero")
-                price = money(dec(li.get("price"), "Price", Decimal(str(prod["price"]))))
+                price = money(Decimal(str(prod["price"])))
                 pct = dec(li.get("discount_pct"), "Discount", Decimal(0))
                 if pct != 0:
                     raise ApiError(400, "Discounts cannot be changed while billing")
@@ -1520,6 +1520,7 @@ button,input,select,textarea{font:inherit;color:inherit}
 .dot{font-style:normal;background:var(--gold);color:#2A1E00;border-radius:99px;min-width:20px;padding:0 6px;font-size:12px;font-weight:800;text-align:center;line-height:20px;margin-left:auto}
 #nav>button.active .dot{background:var(--ink);color:#fff}
 main{padding:28px 32px 48px;max-width:1240px;width:100%}
+main.transaction-main{max-width:none;padding:18px 24px 40px}
 .page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:20px;flex-wrap:wrap}
 .page-head p{margin-top:4px}
 
@@ -1602,19 +1603,16 @@ button.mini{all:unset;box-sizing:border-box;display:flex;justify-content:space-b
 .bar em{font-style:normal;font-size:12px;color:var(--text);font-weight:600}
 
 /* billing screen */
-.tabs2{display:none;gap:8px;margin-bottom:12px}
-.tabs2 button{flex:1;padding:10px;border-radius:9px;border:1px solid var(--line);background:#fff;font-weight:700;display:flex;justify-content:center;gap:8px;align-items:center;cursor:pointer}
-.tabs2 button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
-.pos{display:grid;grid-template-columns:minmax(0,1fr) 430px;gap:20px;align-items:start}
-.pos-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-top:12px}
-.pcard{all:unset;box-sizing:border-box;cursor:pointer;background:#fff;border:1px solid var(--line);border-radius:11px;padding:12px;display:flex;flex-direction:column;gap:3px;min-height:92px}
+.pos{display:flex;flex-direction:column;gap:14px;align-items:stretch}
+.pos-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-top:10px}
+.pcard{all:unset;box-sizing:border-box;cursor:pointer;background:#fff;border:1px solid var(--line);border-radius:10px;padding:9px;display:flex;flex-direction:column;gap:2px;min-height:76px}
 .pcard:hover{border-color:var(--brand)}
 .pcard:focus-visible{outline:3px solid #7CC4BB}
 .pcard b{font-size:14.5px;line-height:1.3;overflow-wrap:anywhere}
 .pcard .pr{font-weight:800;margin-top:auto}
 .pcard small{color:var(--muted)}
 .pcard.out{opacity:.5}
-.pos-bill{position:sticky;top:16px}
+.pos-bill{width:100%}
 .receipt{background:#fff;border-radius:6px 6px 0 0;padding:18px 18px 22px;position:relative;border:1px solid var(--line);border-bottom:0;margin-bottom:12px}
 .receipt::after{content:"";position:absolute;left:-1px;right:-1px;bottom:-11px;height:11px;
   background:linear-gradient(135deg,#fff 50%,transparent 50%) 0 0/16px 11px repeat-x,linear-gradient(225deg,#fff 50%,transparent 50%) 0 0/16px 11px repeat-x;
@@ -1638,7 +1636,6 @@ button.mini{all:unset;box-sizing:border-box;display:flex;justify-content:space-b
 .totals .grand{font-size:22px;font-weight:800;padding-top:8px;border-top:2px solid var(--ink);margin-top:6px}
 .totals .grand dt{color:var(--text)}
 .pay{display:flex;flex-direction:column;gap:10px;margin:14px 0}
-#tab-count:empty{display:none}
 
 /* dialog */
 dialog{border:0;border-radius:14px;padding:0;width:min(520px,94vw);max-height:92vh;box-shadow:0 24px 70px rgba(10,30,36,.4);color:var(--text);background:#fff}
@@ -1693,11 +1690,6 @@ dialog::backdrop{background:rgba(10,30,36,.55)}
 @media (max-width:1000px){
   .tiles{grid-template-columns:1fr 1fr}
   .grid2{grid-template-columns:1fr}
-  .pos{grid-template-columns:1fr}
-  .tabs2{display:flex}
-  .pos[data-tab="items"] .pos-bill{display:none}
-  .pos[data-tab="bill"] .pos-items{display:none}
-  .pos-bill{position:static}
 }
 @media (max-width:860px){
   #app{grid-template-columns:1fr}
@@ -1721,7 +1713,8 @@ dialog::backdrop{background:rgba(10,30,36,.55)}
   dialog.wide{width:100%}
   .two{grid-template-columns:1fr 1fr}
   .tile b{font-size:21px}
-  .pos-grid{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
+  main.transaction-main{padding:14px 10px calc(96px + env(safe-area-inset-bottom))}
+  .pos-grid{grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:7px}
   .upi-qr{align-items:flex-start;gap:10px;padding:10px}
   .upi-qr img{width:116px;height:116px;flex-basis:116px}
 }
@@ -1782,7 +1775,7 @@ const ic = n => `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="current
 /* ---------- state ---------- */
 const S = {
   settings: {}, info: {}, products: [], customers: [], invoices: [], view: 'dashboard',
-  cart: [], cartCustomer: '', billTab: 'items', pay: {mode: 'full', amount: '', method: 'Cash', notes: ''},
+  cart: [], cartCustomer: '', pay: {mode: 'full', amount: '', method: 'Cash', notes: ''},
   posQuery: '', q: {products: '', customers: '', invoices: '', expenses: ''}, lowOnly: false, archived: false,
   invStatus: 'all', invCustomer: '', current: null, focusPos: false,
   financialYear: '', financialYears: []
@@ -2008,8 +2001,13 @@ async function loadAll() {
   S.financialYear = savedYear === 'all' || validYears.includes(savedYear)
     ? savedYear : S.financialYears.current;
   document.title = S.settings.business_name + ' | StockBill';
-  // drop cart lines whose item no longer exists
-  S.cart = S.cart.filter(l => S.products.some(p => p.id === l.product_id && p.active));
+  // Keep pending cart prices and stock aligned with the item catalog.
+  S.cart = S.cart.filter(l => S.products.some(p => p.id === l.product_id && p.active))
+    .map(line => {
+      const product = S.products.find(item => item.id === line.product_id);
+      return {...line, name: product.name, sku: product.sku, unit: product.unit,
+        price: product.price, tax_rate: product.tax_rate, stock: product.stock};
+    });
   saveCart();
 }
 
@@ -2041,6 +2039,10 @@ const ACTION_SHORTCUTS = {
   'new-expense': {label: 'E', key: 'e', global: true},
   logout: {label: 'O', key: 'o', global: true},
   'save-bill': {label: 'F2', key: 'f2', allowTyping: true},
+  'clear-cart': {label: 'F3', key: 'f3', allowTyping: true, billing: true},
+  'pay-cash': {label: 'F5', key: 'f5', allowTyping: true, billing: true, method: 'Cash'},
+  'pay-upi': {label: 'F6', key: 'f6', allowTyping: true, billing: true, method: 'UPI'},
+  'pay-credit': {label: 'F7', key: 'f7', allowTyping: true, billing: true, method: 'credit'},
   'save-settings': {label: 'F4', key: 'f4', allowTyping: true},
   'print-inv': {label: 'P', key: 'p', dialog: true},
   'pay-inv': {label: 'R', key: 'r', dialog: true},
@@ -2059,6 +2061,9 @@ function shortcutFor(el) {
   }
   if (el.closest('form[data-form="settings"]')) return ACTION_SHORTCUTS['save-settings'];
   if (el.dataset.act === 'new-cust') return ACTION_SHORTCUTS['new-customer'];
+  if (el.dataset.act === 'transaction-method') {
+    return ACTION_SHORTCUTS['pay-' + el.dataset.method.toLowerCase()];
+  }
   if (el.dataset.act) return ACTION_SHORTCUTS[el.dataset.act];
   if (['posq', 'pq', 'cq', 'iq', 'eq'].includes(el.dataset.in)) return {label: '/'};
   return null;
@@ -2106,10 +2111,7 @@ actions.logout = () => {
 };
 actions['new-bill'] = () => {
   closeModal();
-  S.billTab = 'items';
   if (S.view === 'billing') {
-    $('.pos').dataset.tab = S.billTab;
-    $$('.tabs2 button').forEach(button => button.classList.toggle('on', button.dataset.tab === S.billTab));
     $('#pos-q').focus();
     return;
   }
@@ -2120,6 +2122,7 @@ async function render() {
   const id = (location.hash.match(/^#\/(\w+)/) || [])[1];
   S.view = (VIEWS[id] || id === 'billing') ? id : 'dashboard';
   renderNav();
+  $('#main').classList.toggle('transaction-main', S.view === 'billing');
   const token = ++renderToken;
   const fn = {dashboard: vDashboard, billing: vBilling, products: vProducts, customers: vCustomers, invoices: vInvoices, accounts: vAccounts, settings: vSettings}[S.view];
   try {
@@ -2172,25 +2175,18 @@ async function vDashboard() {
 /* ================= BILLING ================= */
 async function vBilling() {
   return `<header class="page-head"><h1>New transaction</h1></header>
-    <p class="muted keyboard-help">Keyboard: type an item name or SKU and press Enter to add an exact SKU match. Use Tab to move through item and bill fields; press F2 to save.</p>
-    <div class="tabs2"><button data-act="bill-tab" data-tab="items" class="${S.billTab === 'items' ? 'on' : ''}">Items</button>
-      <button data-act="bill-tab" data-tab="bill" class="${S.billTab === 'bill' ? 'on' : ''}">Bill <i class="dot" id="tab-count"></i></button></div>
-    <div class="pos" data-tab="${S.billTab}">
+    <p class="muted keyboard-help">Shortcuts: F2 confirm bill · F3 clear all · F5 cash · F6 UPI · F7 credit. Search items and press Enter to add an exact SKU match.</p>
+    <div class="pos">
+      <section id="bill" class="pos-bill"></section>
       <section class="pos-items">
         <div class="search">${ic('search')}<input id="pos-q" data-in="posq" placeholder="Search by name or SKU, press Enter to add" autocomplete="off" value="${esc(S.posQuery)}" aria-label="Search items"></div>
         <div id="pos-list" class="pos-grid"></div>
       </section>
-      <section id="bill" class="pos-bill"></section>
     </div>`;
 }
-actions['bill-tab'] = el => {
-  S.billTab = el.dataset.tab; $('.pos').dataset.tab = S.billTab;
-  $$('.tabs2 button').forEach(b => b.classList.toggle('on', b.dataset.tab === S.billTab));
-  window.scrollTo(0, 0);
-};
 function renderPosList() {
   const el = $('#pos-list'); if (!el) return;
-  const list = S.products.filter(p => p.active && matches(p, S.posQuery)).slice(0, 80);
+  const list = S.products.filter(p => p.active && matches(p, S.posQuery));
   el.innerHTML = list.length ? list.map(p => {
     const out = !S.settings.allow_negative_stock && p.stock <= 0;
     return `<button class="pcard ${out ? 'out' : ''}" data-act="add" data-id="${p.id}"><b>${esc(p.name)}</b><small>${esc(p.category || p.sku)}</small>
@@ -2218,10 +2214,13 @@ document.addEventListener('keydown', e => {
     const keyMatches = e.key.toLowerCase() === shortcut.key;
     if (e.repeat || !keyMatches || modified || (typing && !shortcut.allowTyping)) continue;
     if (shortcut.dialog && !$('#dlg').open) continue;
+    if (shortcut.billing && (S.view !== 'billing' || $('#dlg').open)) continue;
     if (shortcut.global && $('#dlg').open) continue;
     const targetAction = action === 'new-customer' && S.view === 'billing' ? 'new-cust' : action;
     const candidates = action === 'save-settings'
       ? $$('form[data-form="settings"] button:not([type="button"])')
+      : shortcut.method
+        ? $$(`[data-act="transaction-method"][data-method="${shortcut.method}"]`)
       : $$(`[data-act="${targetAction}"]`);
     const button = candidates.find(el => !el.disabled && !el.hidden && el.getClientRects().length);
     if (!button && !shortcut.global) continue;
@@ -2282,7 +2281,7 @@ function renderBill() {
         <div class="stepper"><button data-act="dec" data-i="${i}" aria-label="Less">&minus;</button>
           <input class="num" inputmode="decimal" data-in="qty" data-i="${i}" value="${l.qty}" aria-label="Quantity"><button data-act="inc" data-i="${i}" aria-label="More">+</button></div>
         <span class="muted">at</span>
-        <input class="price num" inputmode="decimal" data-in="price" data-i="${i}" value="${l.price}" aria-label="Price per ${esc(l.unit)}">
+        <b class="price num" aria-label="Price per ${esc(l.unit)}">${fmtMoney(l.price)}</b>
         <b class="l-total num" id="lt-${i}">${fmtMoney(c.lines[i])}</b></div>
       <div class="l-sub muted">per ${esc(l.unit)}, tax ${l.tax_rate}% added</div></div>`).join('');
   el.innerHTML = `<div class="receipt">
@@ -2299,7 +2298,7 @@ function renderBill() {
     <div class="pay">
       <div class="chips" role="group" aria-label="Payment method">
         ${[['Cash', 'Cash'], ['UPI', 'UPI'], ['credit', 'Credit']].map(([m, t]) =>
-          `<button class="chip ${m === 'credit' ? cur.mode === 'credit' : cur.mode !== 'credit' && cur.method === m ? 'on' : ''}" data-act="transaction-method" data-method="${m}">${t}</button>`).join('')}</div>
+          `<button class="chip ${(m === 'credit' ? cur.mode === 'credit' : cur.mode !== 'credit' && cur.method === m) ? 'on' : ''}" data-act="transaction-method" data-method="${m}">${t}</button>`).join('')}</div>
       ${cur.method === 'UPI' && cur.mode !== 'credit' ? `<div class="upi-qr" aria-live="polite">
         <img id="upi-qr-image" alt="UPI payment QR for ${esc(fmtMoney(cur.mode === 'part' ? num(cur.amount) : c.grand))}" hidden>
         <div class="upi-qr-copy"><b>Scan to pay ${fmtMoney(cur.mode === 'part' ? num(cur.amount) : c.grand)}</b>
@@ -2309,20 +2308,19 @@ function renderBill() {
       ${cur.mode === 'part' ? `<label class="f"><span>Amount received by ${esc(cur.method)}</span><input inputmode="decimal" data-in="paid" value="${esc(cur.amount)}" placeholder="0.00" required></label>` : ''}
       <label class="f"><span>Note</span><input data-in="notes" maxlength="200" placeholder="Optional" value="${esc(cur.notes)}"></label>
     </div>
-    <button class="btn gold lg block" id="save-btn" data-act="save-bill">Save bill for ${fmtMoney(c.grand)}</button>` : ''}
+    <button class="btn gold lg block" id="save-btn" data-act="save-bill">Confirm bill for ${fmtMoney(c.grand)}</button>` : ''}
   </div>`;
   if (S.cart.length && cur.method === 'UPI' && cur.mode !== 'credit') {
     refreshUpiQr(cur.mode === 'part' ? num(cur.amount) : c.grand);
   } else {
     clearUpiQr();
   }
-  const tc = $('#tab-count'); if (tc) tc.textContent = S.cart.length || '';
 }
 function refreshTotals() {
   const c = calcCart(), set = (id, v) => { const e = $('#' + id); if (e) e.textContent = v; };
   c.lines.forEach((v, i) => set('lt-' + i, fmtMoney(v)));
   set('t-gross', fmtMoney(c.gross)); set('t-tax', fmtMoney(c.tax));
-  set('t-round', fmtMoney(c.round)); set('t-grand', fmtMoney(c.grand)); set('save-btn', 'Save bill for ' + fmtMoney(c.grand));
+  set('t-round', fmtMoney(c.round)); set('t-grand', fmtMoney(c.grand)); set('save-btn', 'Confirm bill for ' + fmtMoney(c.grand));
   if (S.pay.method === 'UPI' && S.pay.mode !== 'credit') {
     refreshUpiQr(S.pay.mode === 'part' ? num(S.pay.amount) : c.grand);
     const label = $('#upi-qr-image');
@@ -2333,7 +2331,6 @@ function refreshTotals() {
 }
 const lineInput = key => (el, e) => { const l = S.cart[+el.dataset.i]; if (!l) return; l[key] = Math.max(0, num(el.value)); saveCart(); refreshTotals(); };
 inputs.qty = (el, e) => { const l = S.cart[+el.dataset.i]; if (!l) return; l.qty = Math.max(0, num(el.value)); clampQty(l); saveCart(); refreshTotals(); };
-inputs.price = lineInput('price');
 inputs.paid = el => { S.pay.amount = el.value; refreshUpiQr(num(S.pay.amount)); };
 inputs.notes = el => { S.pay.notes = el.value; };
 changes.cust = el => { S.cartCustomer = el.value; };
@@ -2370,8 +2367,8 @@ actions['save-bill'] = async el => {
     const inv = await api('/invoices', {method: 'POST', body: {
       customer_id: S.cartCustomer || null, paid,
       payment_method: S.pay.mode === 'credit' ? 'Credit' : S.pay.method, notes: S.pay.notes,
-      items: S.cart.map(l => ({product_id: l.product_id, qty: l.qty, price: l.price}))}});
-    S.cart = []; S.cartCustomer = ''; S.pay = {mode: 'full', amount: '', method: 'Cash', notes: ''}; S.billTab = 'items'; saveCart();
+      items: S.cart.map(l => ({product_id: l.product_id, qty: l.qty}))}});
+    S.cart = []; S.cartCustomer = ''; S.pay = {mode: 'full', amount: '', method: 'Cash', notes: ''}; saveCart();
     await Promise.all([refreshProducts(), refreshCustomers()]);
     toast(`Saved ${inv.number}`, 'ok');
     await render(); showInvoice(inv);
@@ -2816,7 +2813,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
       <p id="credit-note" class="muted" hidden>The full bill amount will be added to this customer's pending balance.</p>
       <div id="qr-wrap" class="qr notice" hidden><img id="qr" alt="UPI payment QR"><span id="qr-label"></span></div>
       <label class="stack"><span>Note</span><input id="note" maxlength="200" placeholder="Optional"></label>
-      <button id="save" class="primary" type="button">Save bill</button>
+      <button id="save" class="primary" type="button">Confirm bill</button>
       <p id="status" role="status"></p>
     </section>
   </section>
@@ -2908,7 +2905,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
       ? "The full bill amount will be added to this customer's pending balance."
       : 'The unpaid balance will be added to this customer.';
     $('#save').textContent = state.part && state.method !== 'Credit'
-      ? `Save bill (${money(paidNow())} received)` : `Save bill for ${money(total())}`;
+      ? `Confirm bill (${money(paidNow())} received)` : `Confirm bill for ${money(total())}`;
     document.querySelectorAll('[data-pay]').forEach(button => button.classList.toggle('on', button.dataset.pay === state.method));
     renderQr();
   }
@@ -3051,7 +3048,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
     renderCart();
   });
   $('#part-amount').addEventListener('input', () => {
-    $('#save').textContent = `Save bill (${money(paidNow())} received)`;
+    $('#save').textContent = `Confirm bill (${money(paidNow())} received)`;
     renderQr();
   });
   $('#customer').addEventListener('change', event => { state.customer = event.target.value; });
@@ -3072,7 +3069,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
       const invoice = await request('/invoices',{method:'POST',body:{
         customer_id:state.customer || null, paid:state.method === 'Credit' ? 0 : paidNow(),
         payment_method:state.method, notes:$('#note').value,
-        items:state.cart.map(item => ({product_id:item.product_id,qty:item.qty,price:item.price}))
+        items:state.cart.map(item => ({product_id:item.product_id,qty:item.qty}))
       }});
       state.cart = []; state.customer = ''; state.part = false; $('#part-amount').value = ''; $('#note').value = ''; $('#customer').value = '';
       await load(); message(`Saved ${invoice.number} for ${money(invoice.grand_total)}.`);
