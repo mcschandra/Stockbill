@@ -512,7 +512,7 @@ class Store:
     # -- customers --------------------------------------------------------- #
     def list_customers(self):
         with self.lock:
-            due, interest_due, bills = {}, {}, {}
+            due, principal_due, interest_due, bills = {}, {}, {}, {}
             for inv in self.data["invoices"]:
                 self._recalc(inv)
                 cid = inv["customer_id"]
@@ -521,9 +521,13 @@ class Store:
                 bills[cid] = bills.get(cid, 0) + 1
                 if inv["status"] != "void":
                     due[cid] = due.get(cid, Decimal(0)) + Decimal(str(inv["total_due"]))
+                    principal_due[cid] = principal_due.get(cid, Decimal(0)) + Decimal(str(inv["principal_balance"]))
                     interest_due[cid] = interest_due.get(cid, Decimal(0)) + Decimal(str(inv["interest_balance"]))
             return [{**c, "due": float(due.get(c["id"], 0)),
-                     "interest_due": float(interest_due.get(c["id"], 0)), "bills": bills.get(c["id"], 0)}
+                     "principal_due": float(principal_due.get(c["id"], 0)),
+                     "interest_due": float(interest_due.get(c["id"], 0)),
+                     "credit_interest_monthly": self.data["settings"].get("credit_interest_monthly", 0),
+                     "bills": bills.get(c["id"], 0)}
                     for c in self.data["customers"]]
 
     def save_customer(self, p, cid=None):
@@ -671,6 +675,7 @@ class Store:
                 lines.append({
                     "product_id": prod["id"], "sku": prod["sku"], "name": prod["name"],
                     "unit": prod["unit"], "qty": float(qty), "price": float(price),
+                    "unit_cost": float(money(Decimal(str(prod["cost"])))),
                     "discount_pct": float(pct), "discount": float(disc),
                     "tax_rate": float(rate), "taxable": float(taxable),
                     "tax": float(tax), "total": float(taxable + tax),
@@ -841,6 +846,33 @@ class Store:
             live = [inv for inv in selected if inv["status"] != "void"]
             expenses = [e for e in self.data["expenses"]
                         if date_in_financial_year(e["date"], year)]
+            net_sales = round(sum(inv["subtotal"] - inv["discount_total"] for inv in live), 2)
+            cogs = float(round(sum((
+                money(Decimal(str(line["unit_cost"])) * Decimal(str(line["qty"])))
+                for inv in live for line in inv["items"] if "unit_cost" in line
+            ), Decimal(0)), 2))
+            uncosted_sales = round(sum(
+                line["taxable"] for inv in live for line in inv["items"] if "unit_cost" not in line
+            ), 2)
+            cash_in_by_method, cash_out_by_method = {}, {}
+            for inv in self.data["invoices"]:
+                if inv["status"] == "void":
+                    continue
+                for payment in inv.get("payments", []):
+                    if date_in_financial_year(payment["date"], year):
+                        method = payment.get("method", "Other")
+                        cash_in_by_method[method] = cash_in_by_method.get(method, 0) + payment["amount"]
+            for expense in expenses:
+                method = expense.get("method", "Other")
+                cash_out_by_method[method] = cash_out_by_method.get(method, 0) + expense["amount"]
+            customers = self.list_customers()
+            credit_customers = [{
+                "id": customer["id"], "name": customer["name"], "phone": customer["phone"],
+                "principal_due": customer["principal_due"], "interest_due": customer["interest_due"],
+                "credit_interest_monthly": customer["credit_interest_monthly"],
+                "total_due": customer["due"],
+            } for customer in customers if customer["due"] > 0]
+            credit_customers.sort(key=lambda customer: customer["total_due"], reverse=True)
             collected = round(sum(
                 payment["amount"] for inv in self.data["invoices"] if inv["status"] != "void"
                 for payment in inv["payments"]
@@ -854,6 +886,15 @@ class Store:
                 "receivables": round(sum(inv["total_due"] for inv in live), 2),
                 "year_tax_billed": round(sum(inv["tax_total"] for inv in live), 2),
                 "year_expense_count": len(expenses),
+                "net_sales": net_sales,
+                "cost_of_goods_sold": cogs,
+                "gross_profit": round(net_sales - cogs, 2),
+                "uncosted_sales": uncosted_sales,
+                "income_statement_expenses": spent,
+                "net_operating_profit": round(net_sales - cogs - spent, 2),
+                "cash_in_by_method": {method: round(amount, 2) for method, amount in cash_in_by_method.items()},
+                "cash_out_by_method": {method: round(amount, 2) for method, amount in cash_out_by_method.items()},
+                "credit_customers": credit_customers,
             }
 
     # -- reports ----------------------------------------------------------- #
@@ -1276,6 +1317,14 @@ def make_handler(store, pin):
                             store.log_activity("business", activity[0], activity[1], 200)
                     else:
                         raise ApiError(404, "Mobile endpoint not found")
+                    if method == "POST" and path == "/api/mobile/invoices":
+                        result = {
+                            **result,
+                            "items": [
+                                {key: value for key, value in line.items() if key != "unit_cost"}
+                                for line in result["items"]
+                            ],
+                        }
                     payload = json.dumps(result, ensure_ascii=False).encode("utf-8")
                     return self._send(200, payload, "application/json; charset=utf-8")
                 if pin_enabled() and not pin_matches(self.headers.get("X-Pin") or ""):
@@ -1576,6 +1625,7 @@ button.row{cursor:pointer}button.row:hover{background:#F7FAF8}
 .archived{opacity:.6}
 .prod{grid-template-columns:minmax(0,1fr) 150px 130px 150px}
 .cust{grid-template-columns:minmax(0,1fr) 150px 160px}
+.credit-row{grid-template-columns:minmax(0,1fr) minmax(260px,1fr) auto 90px}
 .invr{grid-template-columns:130px minmax(0,1fr) 150px 110px 90px}
 .expense-row{grid-template-columns:minmax(0,1fr) 170px 90px 130px}
 .expense-row{grid-template-columns:minmax(0,1fr) 170px 90px 130px}
@@ -1714,6 +1764,9 @@ dialog::backdrop{background:rgba(10,30,36,.55)}
   .prod .r-main{grid-area:m}.prod .r-price{grid-area:p}.prod .r-stock{grid-area:s;justify-self:end}.prod .r-act{grid-area:a}
   .cust{grid-template-columns:minmax(0,1fr) auto}
   .cust .r-act{grid-column:1/-1;justify-content:flex-start}
+  .credit-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"customer total" "detail detail" "actions actions"}
+  .credit-row .credit-customer{grid-area:customer}.credit-row .credit-detail{grid-area:detail}
+  .credit-row .credit-total{grid-area:total}.credit-row .r-act{grid-area:actions}
   .invr{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"n t" "c s" "d d"}
   .invr .a{grid-area:n}.invr .b{grid-area:c}.invr .c{grid-area:d}.invr .d{grid-area:t;text-align:right}.invr .e{grid-area:s;justify-self:end}
     .expense-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"main date" "method amount" "note note"}
@@ -2474,7 +2527,9 @@ function customerRows() {
   const rows = S.customers.filter(c => !q || `${c.name} ${c.phone}`.toLowerCase().includes(q));
   if (!rows.length) return `<div class="empty">${S.customers.length ? 'No customers match.' : 'No customers yet. Save regulars here to track what they owe.'}</div>`;
   return rows.map(c => `<div class="row cust"><div class="r-main"><b>${esc(c.name)}</b><span class="muted">${esc(c.phone || 'No phone')}${c.address ? ', ' + esc(c.address) : ''}</span></div>
-    <div class="num">${c.due > 0 ? `<span class="badge bad">${fmtMoney(c.due)} due</span>${c.interest_due > 0 ? `<br><span class="muted">${fmtMoney(c.interest_due)} interest</span>` : ''}` : `<span class="muted">${c.bills} ${c.bills === 1 ? 'bill' : 'bills'}</span>`}</div>
+    <div class="num">${c.due > 0
+      ? `<span class="badge bad">${fmtMoney(c.due)} total due</span><br><span class="muted">${fmtMoney(c.principal_due)} principal · ${fmtMoney(c.interest_due)} accrued interest</span><br><span class="muted">${Number(c.credit_interest_monthly || 0)}% monthly simple interest on unpaid principal</span>`
+      : `<span class="muted">${c.bills} ${c.bills === 1 ? 'bill' : 'bills'}</span>${Number(c.credit_interest_monthly || 0) > 0 ? `<br><span class="muted">${Number(c.credit_interest_monthly)}% monthly simple interest when due</span>` : ''}`}</div>
     <div class="r-act"><button class="btn ghost sm" data-act="cust-bills" data-id="${c.id}">Bills</button>${c.due > 0 && c.phone ? `<a class="btn ghost sm" href="${whatsappWebLink(c.phone, customerReminder(c))}" target="_blank" rel="noopener noreferrer">Remind on WhatsApp</a>` : ''}<button class="btn ghost sm" data-act="edit-customer" data-id="${c.id}">Edit</button></div></div>`).join('');
 }
 inputs.cq = el => { S.q.customers = el.value; $('#cust-list').innerHTML = customerRows(); };
@@ -2558,23 +2613,25 @@ function whatsappPhone(phone) {
 }
 function whatsappWebLink(phone, message) {
   const number = whatsappPhone(phone);
-  return number ? `https://web.whatsapp.com/send?phone=${encodeURIComponent(number)}&text=${encodeURIComponent(message)}` : '';
+  return number ? `https://wa.me/${encodeURIComponent(number)}?text=${encodeURIComponent(message)}` : '';
 }
 function customerReminder(customer) {
   return `Hello ${customer.name}, a friendly payment reminder from ${S.settings.business_name}. ` +
-    `Your pending bill balance is ${fmtMoney(customer.due)}` +
-    (customer.interest_due > 0 ? `, including ${fmtMoney(customer.interest_due)} accrued interest` : '') +
+    `Your pending bill balance is ${fmtMoney(customer.due)} (${fmtMoney(customer.principal_due)} principal and ${fmtMoney(customer.interest_due)} accrued interest)` +
+    (Number(customer.credit_interest_monthly) > 0
+      ? `. Interest is calculated at ${Number(customer.credit_interest_monthly)}% monthly simple interest on unpaid principal`
+      : '') +
     `. Please let us know if you have already paid. Thank you.`;
 }
 function whatsappLink(inv) {
-  const reminder = inv.status !== 'void' && inv.total_due > 0;
-  const message = reminder
-    ? `Hello ${inv.customer.name}, a friendly payment reminder from ${S.settings.business_name} for invoice ${inv.number} dated ${fmtDay(inv.date)}. ` +
-      `Bill total: ${fmtMoney(inv.grand_total)}.` +
-      (inv.interest_accrued > 0 ? ` Interest accrued: ${fmtMoney(inv.interest_accrued)}.` : '') +
-      (inv.interest_paid > 0 ? ` Interest paid: ${fmtMoney(inv.interest_paid)}.` : '') +
-      ` Amount due: ${fmtMoney(inv.total_due)}. Please let us know if you have already paid. Thank you.`
-    : `${S.settings.business_name}\nInvoice ${inv.number} (${fmtDay(inv.date)})\nTotal: ${fmtMoney(inv.grand_total)}\n${S.settings.footer_note || ''}`;
+  const lines = inv.items.map(line =>
+    `${line.name} × ${fmtQty(line.qty)} ${line.unit} — ${fmtMoney(line.total)}`).join('\n');
+  const due = inv.status !== 'void' && inv.total_due > 0;
+  const message = `Hello ${inv.customer.name},\n${S.settings.business_name} — ${inv.status === 'void' ? 'VOID invoice ' : 'invoice '}${inv.number} (${fmtDay(inv.date)})\n` +
+    `${lines}\nTotal: ${fmtMoney(inv.grand_total)}\nPaid: ${fmtMoney(inv.paid)}\n` +
+    (due ? `Balance due: ${fmtMoney(inv.total_due)}\n` : '') +
+    (inv.interest_accrued > 0 ? `Interest accrued: ${fmtMoney(inv.interest_accrued)}\n` : '') +
+    `${S.settings.footer_note || 'Thank you for your business!'}`;
   return whatsappWebLink(inv.customer.phone, message);
 }
 function showInvoice(inv) {
@@ -2582,7 +2639,7 @@ function showInvoice(inv) {
   const wa = whatsappLink(inv), due = inv.status !== 'void' && inv.total_due > 0;
   openModal('Invoice ' + inv.number, invoiceHTML(inv) + `<div class="dlg-actions">
     <button class="btn" data-act="print-inv">${ic('print')} Print</button>
-    ${wa ? `<a class="btn ghost" href="${wa}" target="_blank" rel="noopener noreferrer">${due ? 'Remind on WhatsApp Web' : 'Send bill on WhatsApp Web'}</a>` : ''}
+    ${wa ? `<a class="btn ghost" href="${wa}" target="_blank" rel="noopener noreferrer">Send invoice via WhatsApp</a>` : ''}
     ${due ? '<button class="btn ghost" data-act="pay-inv">Record payment</button>' : ''}
     ${inv.status !== 'void' ? '<button class="btn danger push" data-act="void-inv">Void bill</button>' : ''}</div>`, {wide: true});
 }
@@ -2730,6 +2787,18 @@ async function vAccounts() {
   ]);
   S.expenses = expenses;
   const yearLabel = S.financialYear === 'all' ? 'all years' : financialYearLabel(S.financialYear);
+  const flowRows = (values, empty) => Object.entries(values).length
+    ? Object.entries(values).sort((a, b) => b[1] - a[1]).map(([method, amount]) =>
+      `<div class="mini"><span>${esc(method)}</span><b class="num">${fmtMoney(amount)}</b></div>`).join('')
+    : `<p class="muted">${empty}</p>`;
+  const creditRows = summary.credit_customers.length
+    ? summary.credit_customers.map(customer => `<div class="row credit-row">
+      <div class="r-main credit-customer"><b>${esc(customer.name)}</b><span class="muted">${esc(customer.phone || 'No phone')}</span></div>
+      <div class="muted credit-detail">Principal ${fmtMoney(customer.principal_due)} · Interest ${fmtMoney(customer.interest_due)} · ${Number(customer.credit_interest_monthly || 0)}% monthly</div>
+      <b class="num r-right credit-total">${fmtMoney(customer.total_due)}</b>
+      <div class="r-act"><button class="btn ghost sm" data-act="cust-bills" data-id="${customer.id}">Bills</button></div>
+    </div>`).join('')
+    : '<div class="empty">No outstanding customer credit.</div>';
   return `<header class="page-head"><div><h1>Accounts</h1><p class="muted">Financial summary and expenses for ${yearLabel}</p></div>
       <div class="chips"><button class="btn ghost" data-act="prepare-wa-reminders">Prepare WhatsApp reminders</button><button class="btn ghost" data-act="dl-expenses">Export expenses</button><button class="btn" data-act="new-expense">Record expense</button></div></header>
     <section class="tiles">
@@ -2739,6 +2808,24 @@ async function vAccounts() {
       <div class="tile"><span class="muted">Receivables</span><b class="num">${fmtMoney(summary.receivables)}</b><span class="muted">Unpaid balances on invoices in this period</span></div>
       <div class="tile"><span class="muted">Tax billed</span><b class="num">${fmtMoney(summary.year_tax_billed)}</b><span class="muted">Not a filed tax return</span></div>
     </section>
+    <section class="grid2">
+      <div class="card stack"><div><h2>Income statement</h2><p class="muted">Sales and recorded costs for ${yearLabel}; excludes tax collected.</p></div>
+        <div class="mini"><span>Net sales</span><b class="num">${fmtMoney(summary.net_sales)}</b></div>
+        <div class="mini"><span>Cost of goods sold</span><b class="num">${fmtMoney(summary.cost_of_goods_sold)}</b></div>
+        <div class="mini"><span>Gross profit (recorded costs)</span><b class="num">${fmtMoney(summary.gross_profit)}</b></div>
+        <div class="mini"><span>Operating expenses</span><b class="num">${fmtMoney(summary.income_statement_expenses)}</b></div>
+        <div class="mini"><b>Net operating profit (recorded costs)</b><b class="num">${fmtMoney(summary.net_operating_profit)}</b></div>
+        ${summary.uncosted_sales > 0 ? `<p class="muted">Cost snapshots are missing for older invoice lines representing ${fmtMoney(summary.uncosted_sales)} in sales. Profit shown excludes those unknown costs.</p>` : ''}
+        <p class="muted">COGS uses each item's saved cost at sale time for new invoices.</p>
+      </div>
+      <div class="card stack"><div><h2>Cash flow statement</h2><p class="muted">${yearLabel}: actual payments received and expenses recorded.</p></div>
+        <div><h3>Cash received by method</h3>${flowRows(summary.cash_in_by_method, 'No payments received in this period.')}</div>
+        <div><h3>Cash paid by method</h3>${flowRows(summary.cash_out_by_method, 'No expenses recorded in this period.')}</div>
+        <div class="mini"><b>Net cash movement</b><b class="num">${fmtMoney(summary.year_net_cash)}</b></div>
+      </div>
+    </section>
+    <header class="page-head"><div><h2>Outstanding credit by customer</h2><p class="muted">Current balances across open credit bills (all invoice dates).</p></div></header>
+    <div class="list">${creditRows}</div>
     <header class="page-head"><div><h2>Expense register</h2><p class="muted">Most recent expenses</p></div></header>
     <div class="toolbar"><div class="search">${ic('search')}<input data-in="eq" value="${esc(S.q.expenses)}" placeholder="Search category, party, reference or note" aria-label="Search expenses"></div></div>
     <div class="list" id="expense-list">${expenseRows()}</div>`;
@@ -2753,7 +2840,7 @@ actions['prepare-wa-reminders'] = async () => {
     <div class="num r-right"><b>${fmtMoney(customer.due)} due</b>${customer.interest_due > 0 ? `<span class="muted">${fmtMoney(customer.interest_due)} interest</span>` : ''}</div>
     <div class="r-act"><a class="btn ghost sm" href="${whatsappWebLink(customer.phone, customerReminder(customer))}" target="_blank" rel="noopener noreferrer">Open reminder draft</a></div></div>`).join('');
   const unavailable = owing.length - reachable.length;
-  openModal('WhatsApp payment reminders', `<p class="muted">Outstanding total: <b class="num">${fmtMoney(totalDue)}</b> across ${owing.length} ${owing.length === 1 ? 'customer' : 'customers'}. Select a draft to open it in WhatsApp Web, review it, and send it yourself. Nothing is sent automatically.</p>
+  openModal('WhatsApp payment reminders', `<p class="muted">Outstanding total: <b class="num">${fmtMoney(totalDue)}</b> across ${owing.length} ${owing.length === 1 ? 'customer' : 'customers'}. Select a draft to open it in WhatsApp, review it, and send it yourself. Nothing is sent automatically.</p>
     ${rows ? `<div class="list">${rows}</div>` : '<div class="empty">No customers with a phone number and a pending balance are ready for a reminder.</div>'}
     ${unavailable ? `<p class="muted" style="margin-top:12px">${unavailable} ${unavailable === 1 ? 'customer has' : 'customers have'} a pending balance but no usable phone number; add a phone number in Customers to prepare a reminder.</p>` : ''}`);
 };
