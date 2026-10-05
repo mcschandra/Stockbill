@@ -16,6 +16,7 @@ Run:
     python stockbill.py --demo               # load sample items to try it out
     python stockbill.py --data D:/shop.json  # choose where the data file lives
     python stockbill.py --host 127.0.0.1     # this computer only (no phone access)
+    python stockbill.py --tls-cert cert.pem --tls-key key.pem  # enable HTTPS camera access
 
 Features: items and stock, customers, billing with GST/tax + discounts, part payments
 and credit (dues), stock history, void bills (stock returns), print invoices,
@@ -34,6 +35,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import sys
 import threading
 import traceback
@@ -627,12 +629,13 @@ class Store:
             if not isinstance(raw_items, list) or not raw_items:
                 raise ApiError(400, "Add at least one item to the bill")
             st = self.data["settings"]
+            method = p.get("payment_method") if p.get("payment_method") in PAY_METHODS else "Cash"
             customer = None
             if p.get("customer_id"):
                 customer = self._find("customers", to_int(p["customer_id"], "Customer"), "Customer")
-            if customer is None:
-                raise ApiError(400, "Choose a customer with a phone number for every bill")
-            if not text(customer.get("phone"), 20):
+            if p.get("payment_method") == "Credit" and customer is None:
+                raise ApiError(400, "Choose a saved customer for a credit transaction")
+            if customer and not text(customer.get("phone"), 20):
                 raise ApiError(400, "Add a phone number to this customer before creating a bill")
 
             # 1) validate and price every line (nothing is changed yet)
@@ -693,8 +696,6 @@ class Store:
             if mobile and p.get("payment_method") in ("Cash", "UPI") and grand > 0 and paid == 0:
                 raise ApiError(400, "Use Credit for a transaction with no upfront payment")
             paid = min(paid, grand)
-            method = p.get("payment_method") if p.get("payment_method") in PAY_METHODS else "Cash"
-
             # 4) apply
             n = self._next("invoice")
             stamp = now()
@@ -704,10 +705,10 @@ class Store:
                 "date": stamp,
                 "customer_id": customer["id"] if customer else None,
                 "customer": {
-                    "name": customer["name"],
-                    "phone": customer["phone"],
-                    "address": customer["address"],
-                    "gstin": customer["gstin"],
+                    "name": customer["name"] if customer else "Walk-in customer",
+                    "phone": customer["phone"] if customer else "",
+                    "address": customer["address"] if customer else "",
+                    "gstin": customer["gstin"] if customer else "",
                 },
                 "items": lines,
                 "subtotal": float(gross_t),
@@ -1415,7 +1416,11 @@ def main():
     ap.add_argument("--pin", default=os.environ.get("STOCKBILL_PIN", ""), help="require this PIN to use the app")
     ap.add_argument("--demo", action="store_true", help="add sample items and customers if the data file is empty")
     ap.add_argument("--no-browser", action="store_true", help="don't open a browser window on start")
+    ap.add_argument("--tls-cert", help="TLS certificate file (enables HTTPS and mobile camera scanning)")
+    ap.add_argument("--tls-key", help="TLS private key file (required with --tls-cert)")
     args = ap.parse_args()
+    if bool(args.tls_cert) != bool(args.tls_key):
+        ap.error("--tls-cert and --tls-key must be provided together")
 
     store = Store(args.data)
     if args.demo:
@@ -1427,21 +1432,29 @@ def main():
             sys.exit("The startup shop PIN must be different from the configured mobile billing PIN.")
 
     ip = lan_ip() if args.host in ("0.0.0.0", "") else None
+    scheme = "https" if args.tls_cert else "http"
     store.info = {
         "data_file": store.path,
-        "lan_url": f"http://{ip}:{args.port}" if ip else None,
+        "lan_url": f"{scheme}://{ip}:{args.port}" if ip else None,
         "pin_enabled": bool(args.pin or store.data["security"]["pin_hash"]),
         "mobile_pin_enabled": bool(store.data["security"]["mobile_pin_hash"]),
     }
 
     try:
         server = Server((args.host, args.port), make_handler(store, args.pin))
+        if args.tls_cert:
+            tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            tls.load_cert_chain(args.tls_cert, args.tls_key)
+            server.socket = tls.wrap_socket(server.socket, server_side=True)
+    except ssl.SSLError as e:
+        store.log_activity("technical", "HTTPS startup failed", str(e), 500)
+        sys.exit(f"Could not configure HTTPS: {e}")
     except OSError as e:
         store.log_activity("technical", "Server startup failed", str(e), 500)
         sys.exit(f"Could not start on port {args.port}: {e}\nTry another port, e.g.  --port 8080")
 
     store.log_activity("technical", "Server started", f"Listening on {args.host}:{args.port}", 200)
-    local = f"http://localhost:{args.port}"
+    local = f"{scheme}://localhost:{args.port}"
     print(f"\n{APP_NAME} is running")
     print(f"  This computer : {local}")
     if store.info["lan_url"]:
@@ -1664,6 +1677,7 @@ dialog::backdrop{background:rgba(10,30,36,.55)}
 .fy-bar select{width:auto;min-width:150px;padding:7px 10px;min-height:38px}
 .custbar{align-items:flex-end}
 .custbar .f{flex:1}
+.keyboard-help{padding:9px 12px;background:var(--card);border:1px solid var(--line);border-radius:9px}
 .pay .chip{align-self:flex-start}
 .login-screen{position:fixed;inset:0;z-index:200;background:var(--paper);display:grid;place-items:center;padding:20px}
 .login-card{width:min(420px,100%);background:var(--card);padding:30px;border:1px solid var(--line);border-radius:16px;box-shadow:0 16px 50px rgba(10,30,36,.14)}
@@ -2001,7 +2015,7 @@ async function loadAll() {
 
 /* ---------- navigation ---------- */
 const VIEWS = {
-  dashboard: {label: 'Home', icon: 'home'}, billing: {label: 'Transactions', icon: 'bill'},
+  dashboard: {label: 'Home', icon: 'home'},
   products: {label: 'Items', icon: 'box'}, customers: {label: 'Customers', icon: 'users'},
   invoices: {label: 'Invoices', icon: 'list'}, accounts: {label: 'Accounts', icon: 'book'}, settings: {label: 'Settings', icon: 'gear'}
 };
@@ -2075,7 +2089,7 @@ shortcutObserver.observe(document.body, {childList: true, subtree: true});
 function renderNav() {
   $('#nav').innerHTML = `<div class="brand">${esc(S.settings.business_name || 'StockBill')}<small>StockBill</small></div>` +
     Object.entries(VIEWS).map(([id, v]) =>
-      `<button data-act="go" data-to="${id}" ${id === S.view ? 'class="active" aria-current="page"' : ''}>${ic(v.icon)}<span>${v.label}</span>${id === 'billing' && S.cart.length ? `<i class="dot">${S.cart.length}</i>` : ''}</button>`).join('') +
+      `<button data-act="go" data-to="${id}" ${id === S.view || (S.view === 'billing' && id === 'dashboard') ? 'class="active" aria-current="page"' : ''}>${ic(v.icon)}<span>${v.label}</span></button>`).join('') +
     `<button data-act="logout"><span>Log out</span></button>`;
 }
 actions.go = el => { closeModal(); location.hash = '#/' + el.dataset.to; };
@@ -2104,7 +2118,7 @@ actions['new-bill'] = () => {
 let renderToken = 0;
 async function render() {
   const id = (location.hash.match(/^#\/(\w+)/) || [])[1];
-  S.view = VIEWS[id] ? id : 'dashboard';
+  S.view = (VIEWS[id] || id === 'billing') ? id : 'dashboard';
   renderNav();
   const token = ++renderToken;
   const fn = {dashboard: vDashboard, billing: vBilling, products: vProducts, customers: vCustomers, invoices: vInvoices, accounts: vAccounts, settings: vSettings}[S.view];
@@ -2158,6 +2172,7 @@ async function vDashboard() {
 /* ================= BILLING ================= */
 async function vBilling() {
   return `<header class="page-head"><h1>New transaction</h1></header>
+    <p class="muted keyboard-help">Keyboard: type an item name or SKU and press Enter to add an exact SKU match. Use Tab to move through item and bill fields; press F2 to save.</p>
     <div class="tabs2"><button data-act="bill-tab" data-tab="items" class="${S.billTab === 'items' ? 'on' : ''}">Items</button>
       <button data-act="bill-tab" data-tab="bill" class="${S.billTab === 'bill' ? 'on' : ''}">Bill <i class="dot" id="tab-count"></i></button></div>
     <div class="pos" data-tab="${S.billTab}">
@@ -2190,7 +2205,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && $('#dlg').open && !$('#dlg').dataset.locked) {
     e.preventDefault(); closeModal(); return;
   }
-  if (!typing && !modified && !$('#dlg').open && /^[1-7]$/.test(e.key)) {
+  if (!typing && !modified && !$('#dlg').open && /^[1-6]$/.test(e.key)) {
     e.preventDefault(); location.hash = '#/' + Object.keys(VIEWS)[Number(e.key) - 1]; return;
   }
   if (!typing && !modified && !$('#dlg').open && e.key === '/') {
@@ -2259,7 +2274,7 @@ function calcCart() {
 function renderBill() {
   const el = $('#bill'); if (!el) return;
   const c = calcCart(), cur = S.pay;
-  const custOpts = '<option value="">Select customer</option>' + S.customers.map(x =>
+  const custOpts = '<option value="">Walk-in customer (no saved customer)</option>' + S.customers.map(x =>
     `<option value="${x.id}" ${String(x.id) === String(S.cartCustomer) ? 'selected' : ''}>${esc(x.name)}${x.phone ? ' (' + esc(x.phone) + ')' : ''}</option>`).join('');
   const lines = S.cart.map((l, i) => `<div class="line">
       <div class="l-top"><b>${esc(l.name)}</b><button class="icon-btn" data-act="rm-line" data-i="${i}" aria-label="Remove ${esc(l.name)}">${ic('x')}</button></div>
@@ -2272,8 +2287,8 @@ function renderBill() {
       <div class="l-sub muted">per ${esc(l.unit)}, tax ${l.tax_rate}% added</div></div>`).join('');
   el.innerHTML = `<div class="receipt">
     <div class="rc-head"><h2>Current bill</h2>${S.cart.length ? '<button class="link" data-act="clear-cart">Clear all</button>' : ''}</div>
-    <div class="custbar"><label class="f"><span>Customer (required for every bill)</span>
-      <select data-ch="cust" aria-label="Customer" required>${custOpts}</select></label>
+    <div class="custbar"><label class="f"><span>Customer (optional for walk-in sales)</span>
+      <select data-ch="cust" aria-label="Customer">${custOpts}</select></label>
       <button class="btn ghost sm" data-act="new-cust">${ic('plus')} New</button></div>
     <div class="lines">${S.cart.length ? lines : '<p class="empty">Tap an item to add it to the bill.</p>'}</div>
     ${S.cart.length ? `<dl class="totals num">
@@ -2290,7 +2305,7 @@ function renderBill() {
         <div class="upi-qr-copy"><b>Scan to pay ${fmtMoney(cur.mode === 'part' ? num(cur.amount) : c.grand)}</b>
           <p class="muted">${esc(S.settings.upi_id || 'UPI ID not set')}</p><p class="muted" id="upi-qr-message"></p></div>
       </div>` : ''}
-      ${cur.mode !== 'credit' ? `<button class="chip ${cur.mode === 'part' ? 'on' : ''}" data-act="part-payment">${cur.mode === 'part' ? 'Part payment on' : 'Record part payment'}</button>` : '<p class="muted">The full amount will be added to this customer’s pending bills.</p>'}
+      ${cur.mode !== 'credit' ? `<button class="chip ${cur.mode === 'part' ? 'on' : ''}" data-act="part-payment">${cur.mode === 'part' ? 'Part payment on' : 'Record part payment'}</button>` : '<p class="muted">Credit bills require a saved customer and will be added to their pending bills.</p>'}
       ${cur.mode === 'part' ? `<label class="f"><span>Amount received by ${esc(cur.method)}</span><input inputmode="decimal" data-in="paid" value="${esc(cur.amount)}" placeholder="0.00" required></label>` : ''}
       <label class="f"><span>Note</span><input data-in="notes" maxlength="200" placeholder="Optional" value="${esc(cur.notes)}"></label>
     </div>
@@ -2338,8 +2353,13 @@ actions['save-bill'] = async el => {
   if (!S.cart.length) return toast('Add at least one item', 'err');
   if (S.cart.some(l => !(l.qty > 0))) return toast('Every item needs a quantity above zero', 'err');
   const customer = S.customers.find(c => String(c.id) === String(S.cartCustomer));
-  if (!customer || !customer.phone) {
-    toast('Choose a customer with a phone number for every bill', 'err');
+  if (S.pay.mode === 'credit' && !customer) {
+    toast('Choose a saved customer for a credit transaction', 'err');
+    $('[data-ch="cust"]')?.focus();
+    return;
+  }
+  if (customer && !customer.phone) {
+    toast('Add a phone number to the selected customer before billing', 'err');
     $('[data-ch="cust"]')?.focus();
     return;
   }
@@ -2348,7 +2368,8 @@ actions['save-bill'] = async el => {
   el.disabled = true;
   try {
     const inv = await api('/invoices', {method: 'POST', body: {
-      customer_id: S.cartCustomer || null, paid, payment_method: S.pay.method, notes: S.pay.notes,
+      customer_id: S.cartCustomer || null, paid,
+      payment_method: S.pay.mode === 'credit' ? 'Credit' : S.pay.method, notes: S.pay.notes,
       items: S.cart.map(l => ({product_id: l.product_id, qty: l.qty, price: l.price}))}});
     S.cart = []; S.cartCustomer = ''; S.pay = {mode: 'full', amount: '', method: 'Cash', notes: ''}; S.billTab = 'items'; saveCart();
     await Promise.all([refreshProducts(), refreshCustomers()]);
@@ -2759,6 +2780,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
 .total{display:flex;justify-content:space-between;padding:10px 0;font-weight:800;font-size:18px;border-top:1px solid #e0e7e4}
 .primary{width:100%;background:#f2a900;color:#18343b}.notice{padding:10px;background:#fff1d6;border-radius:8px}.error{color:#a52828}.qr{display:flex;align-items:center;gap:12px}.qr img{width:120px;height:120px}
 [hidden]{display:none!important}
+.scanner{width:100%;max-height:55vh;background:#102329;border-radius:9px}
 </style></head>
 <body><main>
   <section id="login" class="card stack">
@@ -2766,7 +2788,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
     <p id="login-help" class="muted">Enter the mobile billing PIN.</p>
     <form id="login-form" class="stack"><input id="pin" type="password" inputmode="numeric" autocomplete="one-time-code" minlength="4" maxlength="12" placeholder="Mobile PIN" aria-label="Mobile PIN" required><button>Sign in</button></form>
     <p id="login-error" class="error" role="alert"></p>
-    <p class="muted">The mobile PIN only grants access to billing. Use only on a trusted private Wi-Fi network because HTTP is unencrypted. Camera scanning is unavailable on HTTP; search or enter an item SKU/barcode.</p>
+    <p class="muted">The mobile PIN only grants access to billing. Use only on a trusted private Wi-Fi network. Camera scanning requires HTTPS, a supported browser, and a product QR/barcode containing its SKU.</p>
   </section>
   <section id="app" hidden>
     <header class="head"><div class="brand"><h1 id="shop-name">StockBill</h1><small>New transaction</small></div><button id="logout" type="button">Log out</button></header>
@@ -2774,11 +2796,14 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
       <h2>Find items</h2>
       <input id="search" autocomplete="off" placeholder="Search item or enter SKU/barcode" aria-label="Search item or enter SKU/barcode">
       <p class="muted">A keyboard-style barcode reader can type into this field and press Enter.</p>
+      <button id="scan-toggle" type="button">Scan barcode / QR code</button>
+      <video id="scanner" class="scanner" playsinline hidden aria-label="Camera preview"></video>
+      <p id="scan-help" class="muted" role="status"></p>
       <div id="products" class="grid"></div>
     </section>
     <section class="card stack">
       <h2>Current bill</h2>
-      <label class="stack"><span>Customer (required for every bill)</span><select id="customer" required></select></label>
+      <label class="stack"><span>Customer (optional for walk-in sales)</span><select id="customer"></select></label>
       <div id="cart"></div>
       <div class="total"><span>Total</span><span id="total"></span></div>
       <div class="chips" role="group" aria-label="Payment method">
@@ -2799,7 +2824,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
 <script>
 (() => {
   const $ = selector => document.querySelector(selector);
-  const state = {pin:'',products:[],customers:[],settings:{},cart:[],customer:'',method:'Cash',part:false,qrUrl:'',qrRequest:0};
+  const state = {pin:'',products:[],customers:[],settings:{},cart:[],customer:'',method:'Cash',part:false,qrUrl:'',qrRequest:0,scanStream:null,scanFrame:0,scanner:null,scanning:false};
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   const money = value => `${state.settings.currency || '₹'}${Number(value || 0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}`;
   async function request(path, options={}) {
@@ -2820,6 +2845,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
   }
   function message(text, error=false) { $('#status').textContent = text; $('#status').className = error ? 'error' : 'muted'; }
   function logout(text='') {
+    stopScanner();
     state.qrRequest += 1;
     if (state.qrUrl) URL.revokeObjectURL(state.qrUrl);
     state.qrUrl = ''; state.pin = ''; $('#pin').value = '';
@@ -2876,7 +2902,7 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
     $('#part-toggle').classList.toggle('on', state.part);
     $('#part-toggle').textContent = state.part ? 'Part payment on' : 'Record part payment';
     $('#part-amount-wrap').hidden = !state.part;
-    $('#customer').required = true;
+    $('#customer').required = false;
     $('#credit-note').hidden = state.method !== 'Credit' && !state.part;
     $('#credit-note').textContent = state.method === 'Credit'
       ? "The full bill amount will be added to this customer's pending balance."
@@ -2893,11 +2919,83 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
     $('#search').value = ''; renderProducts(); renderCart(); message('');
     $('#search').focus();
   }
+  function stopScanner() {
+    state.scanning = false;
+    if (state.scanFrame) cancelAnimationFrame(state.scanFrame);
+    state.scanFrame = 0;
+    if (state.scanStream) state.scanStream.getTracks().forEach(track => track.stop());
+    state.scanStream = null;
+    $('#scanner').srcObject = null;
+    $('#scanner').hidden = true;
+    $('#scan-toggle').textContent = 'Scan barcode / QR code';
+  }
+  async function scanFrame() {
+    if (!state.scanning) return;
+    const video = $('#scanner');
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      try {
+        const codes = await state.scanner.detect(video);
+        const value = codes.find(code => code.rawValue)?.rawValue.trim();
+        if (value) {
+          const matches = state.products.filter(item => item.active && item.sku.trim().toLowerCase() === value.toLowerCase());
+          if (matches.length === 1) {
+            stopScanner();
+            addItem(matches[0]);
+            return;
+          }
+          $('#scan-help').textContent = matches.length
+            ? 'This code matches multiple items; update the SKUs so each item is unique.'
+            : `No item found for code "${value}". Item codes must contain the exact SKU.`;
+          $('#scan-help').className = 'error';
+        }
+      } catch (error) {
+        stopScanner();
+        message(`Could not scan the camera image: ${error.message}`, true);
+        return;
+      }
+    }
+    if (state.scanning) state.scanFrame = requestAnimationFrame(scanFrame);
+  }
+  async function startScanner() {
+    if (!window.isSecureContext) {
+      $('#scan-help').textContent = 'Camera scanning needs HTTPS. Restart StockBill with --tls-cert and --tls-key, then open its HTTPS address on your phone.';
+      $('#scan-help').className = 'error';
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia || !('BarcodeDetector' in window)) {
+      $('#scan-help').textContent = 'This browser does not support camera barcode scanning. Use a supported browser or enter the SKU/barcode above.';
+      $('#scan-help').className = 'error';
+      return;
+    }
+    try {
+      const supported = await BarcodeDetector.getSupportedFormats();
+      const formats = ['qr_code','ean_13','ean_8','upc_a','upc_e','code_128','code_39','itf','codabar']
+        .filter(format => supported.includes(format));
+      if (!formats.length) throw new Error('No supported QR or barcode formats are available.');
+      state.scanner = new BarcodeDetector({formats});
+      state.scanStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
+      const video = $('#scanner');
+      video.srcObject = state.scanStream;
+      video.hidden = false;
+      await video.play();
+      state.scanning = true;
+      $('#scan-help').textContent = 'Point the rear camera at an item QR code or barcode containing its SKU.';
+      $('#scan-help').className = 'muted';
+      $('#scan-toggle').textContent = 'Stop scanning';
+      state.scanFrame = requestAnimationFrame(scanFrame);
+    } catch (error) {
+      stopScanner();
+      $('#scan-help').textContent = error.name === 'NotAllowedError'
+        ? 'Camera access was denied. Allow camera access in your browser settings and try again.'
+        : `Could not start the camera scanner: ${error.message}`;
+      $('#scan-help').className = 'error';
+    }
+  }
   async function load() {
     const [settings,products,customers] = await Promise.all([request('/settings'),request('/products'),request('/customers')]);
     state.settings = settings; state.products = products; state.customers = customers;
     $('#shop-name').textContent = settings.business_name || 'StockBill';
-    $('#customer').innerHTML = '<option value="">Select customer</option>' + customers.map(customer =>
+    $('#customer').innerHTML = '<option value="">Walk-in customer (no saved customer)</option>' + customers.map(customer =>
       `<option value="${customer.id}">${esc(customer.name)}${customer.phone ? ` (${esc(customer.phone)})` : ''}</option>`).join('');
     $('#customer').value = state.customer;
     $('#app').hidden = false; $('#login').hidden = true;
@@ -2914,6 +3012,10 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
     } catch (error) { state.pin = ''; $('#login-error').textContent = error.message; }
   });
   $('#search').addEventListener('input', renderProducts);
+  $('#scan-toggle').addEventListener('click', () => {
+    if (state.scanning) stopScanner();
+    else startScanner();
+  });
   $('#search').addEventListener('keydown', event => {
     if (event.key !== 'Enter') return;
     event.preventDefault();
@@ -2957,8 +3059,11 @@ h1{font-size:21px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted{color:#687b7
   $('#save').addEventListener('click', async event => {
     if (!state.cart.length) return message('Add at least one item.', true);
     const customer = state.customers.find(row => String(row.id) === String(state.customer));
-    if (!customer || !customer.phone) {
-      $('#customer').focus(); return message('Select a customer with a phone number for every bill.', true);
+    if (state.method === 'Credit' && !customer) {
+      $('#customer').focus(); return message('Select a saved customer for a credit transaction.', true);
+    }
+    if (customer && !customer.phone) {
+      $('#customer').focus(); return message('Add a phone number to the selected customer before billing.', true);
     }
     if (state.part && !(paidNow() > 0 && paidNow() <= total())) return message('Enter an amount above zero and no more than the bill total.', true);
     const button = event.currentTarget; button.disabled = true;
