@@ -1,0 +1,55 @@
+{"timestamp": "2026-10-03 22:36:06", "category": "technical", "event": "Server started", "details": "Listening on 0.0.0.0:8000", "status": 200}
+{"timestamp": "2026-10-03 22:36:12", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-03 22:36:44", "category": "security", "event": "Mobile billing PIN updated", "details": "", "status": 200}
+{"timestamp": "2026-10-03 22:37:12", "category": "security", "event": "Mobile billing sign-in succeeded", "details": "Remote address 10.228.59.192", "status": 200}
+{"timestamp": "2026-10-03 22:38:33", "category": "business", "event": "Invoice created", "details": "INV-00003 for Walk-in customer; total 60000.00, paid 60000.00, balance 0.00", "status": 200}
+{"timestamp": "2026-10-03 22:42:45", "category": "security", "event": "Request rejected", "details": "POST /api/mobile/login returned HTTP 401: Incorrect mobile PIN", "status": 401}
+{"timestamp": "2026-10-03 22:43:06", "category": "technical", "event": "Server stopped", "details": "HTTP server closed", "status": null}
+{"timestamp": "2026-10-04 14:25:20", "category": "technical", "event": "Server started", "details": "Listening on 0.0.0.0:8000", "status": 200}
+{"timestamp": "2026-10-04 14:25:27", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-04 14:32:46", "category": "security", "event": "Mobile billing sign-in succeeded", "details": "Remote address 10.228.59.192", "status": 200}
+{"timestamp": "2026-10-04 14:47:46", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-04 14:48:18", "category": "technical", "event": "Server stopped", "details": "HTTP server closed", "status": null}
+{"timestamp": "2026-10-04 14:48:21", "category": "technical", "event": "Server started", "details": "Listening on 0.0.0.0:8000", "status": 200}
+{"timestamp": "2026-10-04 14:48:28", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-04 15:00:21", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-04 15:30:13", "category": "technical", "event": "Server stopped", "details": "HTTP server closed", "status": null}
+{"timestamp": "2026-10-04 15:30:19", "category": "technical", "event": "Server started", "details": "Listening on 0.0.0.0:8000", "status": 200}
+{"timestamp": "2026-10-04 15:30:24", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-04 15:32:42", "category": "security", "event": "Mobile billing sign-in succeeded", "details": "Remote address 10.228.59.192", "status": 200}
+{"timestamp": "2026-10-04 15:33:23", "category": "business", "event": "Invoice created", "details": "INV-00001 for Agri Test Customer; total 473.00, paid 473.00, balance 0.00", "status": 200}
+{"timestamp": "2026-10-04 15:34:36", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-04 15:57:02", "category": "technical", "event": "Server stopped", "details": "HTTP server closed", "status": null}
+{"timestamp": "2026-10-05 19:10:44", "category": "technical", "event": "Server started", "details": "Listening on 127.0.0.1:18765", "status": 200}
+{"timestamp": "2026-10-05 19:10:51", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-05 19:11:04", "category": "business", "event": "Invoice created", "details": "INV-00001 for Walk-in customer; total 441.00, paid 441.00, balance 0.00", "status": 200}
+{"timestamp": "2026-10-05 19:15:23", "category": "technical", "event": "Server started", "details": "Listening on 0.0.0.0:8000", "status": 200}
+{"timestamp": "2026-10-05 19:15:56", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-05 19:18:25", "category": "business", "event": "Invoice created", "details": "INV-00002 for Walk-in customer; total 614.00, paid 614.00, balance 0.00", "status": 200}
+{"timestamp": "2026-10-05 19:18:45", "category": "business", "event": "Invoice created", "details": "INV-00003 for Walk-in customer; total 1701.00, paid 1701.00, balance 0.00", "status": 200}
+{"timestamp": "2026-10-05 19:22:07", "category": "technical", "event": "Server started", "details": "Listening on 127.0.0.1:18766", "status": 200}
+{"timestamp": "2026-10-05 19:22:13", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-05 19:32:18", "category": "technical", "event": "Server started", "details": "Listening on 127.0.0.1:18767", "status": 200}
+{"timestamp": "2026-10-05 19:32:23", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-05 19:33:30", "category": "technical", "event": "Server started", "details": "Listening on 127.0.0.1:18767", "status": 200}
+{"timestamp": "2026-10-05 19:33:38", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-05 19:34:23", "category": "technical", "event": "Server started", "details": "Listening on 127.0.0.1:18767", "status": 200}
+{"timestamp": "2026-10-05 19:34:29", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-05 19:49:06", "category": "technical", "event": "Server stopped", "details": "HTTP server closed", "status": null}
+{"timestamp": "2026-10-05 19:56:49", "category": "technical", "event": "Server started", "details": "Listening on 0.0.0.0:8000", "status": 200}
+{"timestamp": "2026-10-05 19:56:54", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-05 19:58:11", "category": "business", "event": "Invoice created", "details": "INV-00004 for Walk-in customer; total 2272.00, paid 2272.00, balance 0.00", "status": 200}
+{"timestamp": "2026-10-05 19:59:26", "category": "security", "event": "Signed out", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-05 20:13:11", "category": "technical", "event": "Server stopped", "details": "HTTP server closed", "status": null}
+{"timestamp": "2026-10-05 20:14:42", "category": "technical", "event": "Server started", "details": "Listening on 127.0.0.1:18768", "status": 200}
+{"timestamp": "2026-10-05 20:14:48", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-05 20:15:10", "category": "business", "event": "Shop settings updated", "details": "", "status": 200}
+{"timestamp": "2026-10-05 20:15:10", "category": "business", "event": "Shop settings updated", "details": "", "status": 200}
+{"timestamp": "2026-10-05 20:27:39", "category": "technical", "event": "Server started", "details": "Listening on 127.0.0.1:8765", "status": 200}
+{"timestamp": "2026-10-05 20:27:49", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-05 20:28:34", "category": "business", "event": "Invoice created", "details": "INV-00001 for Green Fields Farm; total 441.00, paid 441.00, balance 0.00", "status": 200}
+{"timestamp": "2026-10-05 20:32:50", "category": "technical", "event": "Server started", "details": "Listening on 0.0.0.0:8000", "status": 200}
+{"timestamp": "2026-10-05 20:32:55", "category": "security", "event": "Sign-in succeeded", "details": "Remote address 127.0.0.1", "status": 200}
+{"timestamp": "2026-10-05 20:35:46", "category": "technical", "event": "Browser error", "details": "Uncaught TypeError: Cannot read properties of undefined (reading 'toLowerCase')\nTypeError: Cannot read properties of undefined (reading 'toLowerCase')\n    at HTMLDocument.<anonymous> (http://localhost:8000/:749:30)", "status": 500}
+{"timestamp": "2026-10-05 20:36:36", "category": "business", "event": "Shop settings updated", "details": "", "status": 200}
+{"timestamp": "2026-10-05 20:38:47", "category": "technical", "event": "Server stopped", "details": "HTTP server closed", "status": null}
