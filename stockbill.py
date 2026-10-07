@@ -11,8 +11,7 @@ Install dependencies:
     python -m pip install -r requirements.txt
 
 Run:
-    python stockbill.py                      # starts on port 8000
-    python stockbill.py --pin 4321           # require a PIN (recommended on shared Wi-Fi)
+    python stockbill.py                      # create an email/password account on first open
     python stockbill.py --demo               # load sample items to try it out
     python stockbill.py --data D:/shop.json  # choose where the data file lives
     python stockbill.py --host 127.0.0.1     # this computer only (no phone access)
@@ -174,6 +173,35 @@ def valid_pin(pin):
     return isinstance(pin, str) and re.fullmatch(r"\d{4,12}", pin) is not None
 
 
+def normalize_email(email):
+    return email.strip().lower() if isinstance(email, str) else ""
+
+
+def valid_email(email):
+    return isinstance(email, str) and len(email) <= 254 and re.fullmatch(
+        r"[^@\s]+@[^@\s]+\.[^@\s]+", email
+    ) is not None
+
+
+def password_digest(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 600_000)
+
+
+def stored_password_matches(candidate, salt_hex, hash_hex):
+    if not isinstance(candidate, str) or not salt_hex or not hash_hex:
+        return False
+    try:
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(hash_hex)
+    except ValueError:
+        return False
+    return hmac.compare_digest(password_digest(candidate, salt), expected)
+
+
+def valid_password(password):
+    return isinstance(password, str) and 8 <= len(password) <= 256
+
+
 def valid_upi_id(value):
     return isinstance(value, str) and re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}@[A-Za-z][A-Za-z0-9.-]{1,62}", value
@@ -205,7 +233,7 @@ class Store:
             "counters": {"product": 0, "customer": 0, "invoice": 0, "stock": 0, "expense": 0},
             "settings": dict(DEFAULT_SETTINGS),
             "security": {
-                "pin_salt": "", "pin_hash": "",
+                "account_email": "", "account_password_salt": "", "account_password_hash": "",
                 "mobile_pin_salt": "", "mobile_pin_hash": "",
             },
             "products": [],
@@ -374,16 +402,21 @@ class Store:
             image.save(output)
             return output.getvalue()
 
-    def update_pin(self, pin):
-        if not valid_pin(pin):
-            raise ApiError(400, "PIN must contain 4 to 12 digits")
-        salt = secrets.token_bytes(16)
+    def update_account(self, email, password=None):
+        email = normalize_email(email)
+        if not valid_email(email):
+            raise ApiError(400, "Enter a valid email address")
+        if password is not None and not valid_password(password):
+            raise ApiError(400, "Password must be 8 to 256 characters")
         with self.lock:
-            self.data["security"] = {
-                "pin_salt": salt.hex(),
-                "pin_hash": pin_digest(pin, salt).hex(),
-            }
+            security = self.data["security"]
+            security["account_email"] = email
+            if password is not None:
+                salt = secrets.token_bytes(16)
+                security["account_password_salt"] = salt.hex()
+                security["account_password_hash"] = password_digest(password, salt).hex()
             self._commit()
+        return email
 
     def update_mobile_pin(self, pin):
         if not valid_pin(pin):
@@ -1120,30 +1153,22 @@ def build_routes(store):
     ]
 
 
-def make_handler(store, pin):
+def make_handler(store):
     routes = [(meth, re.compile(pat), fn) for meth, pat, fn in build_routes(store)]
-    security = store.data["security"]
-    pin_state = {
-        "salt": security.get("pin_salt", ""),
-        "hash": security.get("pin_hash", ""),
-        "plain": pin if not security.get("pin_hash") else "",
-    }
+    desktop_sessions = set()
     mobile_pin_state = {
-        "salt": security.get("mobile_pin_salt", ""),
-        "hash": security.get("mobile_pin_hash", ""),
+        "salt": store.data["security"].get("mobile_pin_salt", ""),
+        "hash": store.data["security"].get("mobile_pin_hash", ""),
     }
 
-    def pin_enabled():
-        return bool(pin_state["hash"] or pin_state["plain"])
-
-    def pin_matches(candidate):
-        if not isinstance(candidate, str):
-            return False
-        if pin_state["hash"]:
-            return stored_pin_matches(candidate, pin_state["salt"], pin_state["hash"])
-        return bool(pin_state["plain"]) and hmac.compare_digest(
-            candidate.encode("utf-8"), pin_state["plain"].encode("utf-8")
+    def account_configured():
+        security = store.data["security"]
+        return bool(
+            security.get("account_email")
+            and security.get("account_password_salt")
+            and security.get("account_password_hash")
         )
+
     def mobile_pin_matches(candidate):
         return stored_pin_matches(candidate, mobile_pin_state["salt"], mobile_pin_state["hash"])
     page = PAGE.encode("utf-8")
@@ -1224,17 +1249,45 @@ def make_handler(store, pin):
                     return self._send(200, icon, "image/svg+xml")
                 if path == "/api/login":
                     if method == "GET":
-                        return self._json(200, {"pin_enabled": pin_enabled()})
+                        return self._json(200, {"account_configured": account_configured()})
                     if method == "POST":
                         failure_category = "security"
-                        candidate = body.get("pin", "")
-                        if pin_enabled() and not pin_matches(candidate):
-                            raise ApiError(401, "Incorrect PIN")
+                        email = normalize_email(body.get("email"))
+                        password = body.get("password", "")
+                        with store.lock:
+                            if not account_configured():
+                                if self.client_address[0] not in ("127.0.0.1", "::1"):
+                                    raise ApiError(403, "Create the first account from the computer running StockBill")
+                                if not valid_email(email):
+                                    raise ApiError(400, "Enter a valid email address")
+                                if not valid_password(password):
+                                    raise ApiError(400, "Password must be 8 to 256 characters")
+                                if body.get("confirm_password") != password:
+                                    raise ApiError(400, "Password and confirmation do not match")
+                                store.update_account(email, password)
+                            else:
+                                security = store.data["security"]
+                                if (
+                                    email != security.get("account_email")
+                                    or not valid_password(password)
+                                    or not stored_password_matches(
+                                        password,
+                                        security.get("account_password_salt", ""),
+                                        security.get("account_password_hash", ""),
+                                    )
+                                ):
+                                    raise ApiError(401, "Incorrect email or password")
+                        session_token = secrets.token_urlsafe(32)
+                        desktop_sessions.add(session_token)
+                        store.info["account_email"] = email
                         store.log_activity(
                             "security", "Sign-in succeeded",
                             f"Remote address {self.client_address[0]}", 200
                         )
-                        return self._json(200, {"authenticated": True})
+                        return self._json(200, {
+                            "authenticated": True, "session_token": session_token,
+                            "account_email": email,
+                        })
                     raise ApiError(405, "Method not allowed")
                 if path == "/api/mobile/login":
                     if method == "GET":
@@ -1251,28 +1304,6 @@ def make_handler(store, pin):
                         )
                         return self._json(200, {"authenticated": True})
                     raise ApiError(405, "Method not allowed")
-                if path == "/api/pin":
-                    failure_category = "security"
-                    if method != "POST":
-                        raise ApiError(405, "Method not allowed")
-                    with store.lock:
-                        current = self.headers.get("X-Pin") or ""
-                        if pin_enabled() and (
-                            not pin_matches(current) or not pin_matches(body.get("current_pin"))
-                        ):
-                            raise ApiError(401, "Current PIN is incorrect")
-                        new_pin = body.get("new_pin")
-                        if not valid_pin(new_pin):
-                            raise ApiError(400, "New PIN must contain 4 to 12 digits")
-                        if mobile_pin_matches(new_pin):
-                            raise ApiError(400, "Choose a shop PIN different from the mobile PIN")
-                        store.update_pin(new_pin)
-                        pin_state["salt"] = store.data["security"]["pin_salt"]
-                        pin_state["hash"] = store.data["security"]["pin_hash"]
-                        pin_state["plain"] = ""
-                        store.info["pin_enabled"] = True
-                    store.log_activity("security", "PIN changed", "The shop PIN was updated", 200)
-                    return self._json(200, {"pin_enabled": True})
                 if not path.startswith("/api/"):
                     raise ApiError(404, "Not found")
                 if path.startswith("/api/mobile/"):
@@ -1327,9 +1358,13 @@ def make_handler(store, pin):
                         }
                     payload = json.dumps(result, ensure_ascii=False).encode("utf-8")
                     return self._send(200, payload, "application/json; charset=utf-8")
-                if pin_enabled() and not pin_matches(self.headers.get("X-Pin") or ""):
+                if not account_configured():
                     failure_category = "security"
-                    raise ApiError(401, "PIN required")
+                    raise ApiError(401, "Create an account before accessing StockBill")
+                session_token = self.headers.get("X-Session-Token") or ""
+                if session_token not in desktop_sessions:
+                    failure_category = "security"
+                    raise ApiError(401, "Sign in required")
                 query = parse_qs(url.query)
                 if path == "/api/logout":
                     failure_category = "security"
@@ -1339,7 +1374,49 @@ def make_handler(store, pin):
                         "security", "Signed out",
                         f"Remote address {self.client_address[0]}", 200
                     )
+                    desktop_sessions.discard(session_token)
                     return self._json(200, {"logged_out": True})
+                if path == "/api/account":
+                    failure_category = "security"
+                    if method != "POST":
+                        raise ApiError(405, "Method not allowed")
+                    with store.lock:
+                        security = store.data["security"]
+                        current_password = body.get("current_password", "")
+                        if not stored_password_matches(
+                            current_password,
+                            security.get("account_password_salt", ""),
+                            security.get("account_password_hash", ""),
+                        ):
+                            raise ApiError(401, "Current password is incorrect")
+                        new_password = body.get("new_password") or None
+                        if not new_password and body.get("confirm_password"):
+                            raise ApiError(400, "Enter a new password before confirming it")
+                        if new_password is not None:
+                            if not valid_password(new_password):
+                                raise ApiError(400, "New password must be 8 to 256 characters")
+                            if body.get("confirm_password") != new_password:
+                                raise ApiError(400, "New password and confirmation do not match")
+                        email = store.update_account(body.get("email"), new_password)
+                        store.info["account_email"] = email
+                        session_token = secrets.token_urlsafe(32)
+                        desktop_sessions.clear()
+                        desktop_sessions.add(session_token)
+                    store.log_activity("security", "Account updated", email, 200)
+                    return self._json(200, {
+                        "account_email": email, "session_token": session_token
+                    })
+                if method == "GET" and path == "/api/mobile-access-qr":
+                    lan_url = store.info.get("lan_url")
+                    if not lan_url:
+                        raise ApiError(400, "Mobile access is unavailable when the server is bound to localhost")
+                    qr = qrcode.QRCode(box_size=8, border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
+                    qr.add_data(lan_url + "/mobile")
+                    qr.make(fit=True)
+                    image = qr.make_image(image_factory=SvgPathImage)
+                    output = io.BytesIO()
+                    image.save(output)
+                    return self._send(200, output.getvalue(), "image/svg+xml; charset=utf-8")
                 if path == "/api/mobile-pin":
                     failure_category = "security"
                     if method != "POST":
@@ -1356,8 +1433,6 @@ def make_handler(store, pin):
                     new_pin = body.get("new_pin")
                     if not valid_pin(new_pin):
                         raise ApiError(400, "Mobile PIN must contain 4 to 12 digits")
-                    if pin_matches(new_pin):
-                        raise ApiError(400, "Choose a mobile PIN different from the shop PIN")
                     store.update_mobile_pin(new_pin)
                     mobile_pin_state["salt"] = store.data["security"]["mobile_pin_salt"]
                     mobile_pin_state["hash"] = store.data["security"]["mobile_pin_hash"]
@@ -1462,7 +1537,6 @@ def main():
     ap.add_argument("--data", default=os.path.join(here, "stockbill_data.json"), help="path of the JSON data file")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0", help="0.0.0.0 = reachable from phones on your Wi-Fi; 127.0.0.1 = this computer only")
-    ap.add_argument("--pin", default=os.environ.get("STOCKBILL_PIN", ""), help="require this PIN to use the app")
     ap.add_argument("--demo", action="store_true", help="add sample items and customers if the data file is empty")
     ap.add_argument("--no-browser", action="store_true", help="don't open a browser window on start")
     ap.add_argument("--tls-cert", help="TLS certificate file (enables HTTPS and mobile camera scanning)")
@@ -1474,23 +1548,17 @@ def main():
     store = Store(args.data)
     if args.demo:
         seed_demo(store)
-    if args.pin and store.data["security"].get("mobile_pin_hash"):
-        if stored_pin_matches(
-                args.pin, store.data["security"]["mobile_pin_salt"],
-                store.data["security"]["mobile_pin_hash"]):
-            sys.exit("The startup shop PIN must be different from the configured mobile billing PIN.")
-
     ip = lan_ip() if args.host in ("0.0.0.0", "") else None
     scheme = "https" if args.tls_cert else "http"
     store.info = {
         "data_file": store.path,
         "lan_url": f"{scheme}://{ip}:{args.port}" if ip else None,
-        "pin_enabled": bool(args.pin or store.data["security"]["pin_hash"]),
+        "account_email": store.data["security"].get("account_email", ""),
         "mobile_pin_enabled": bool(store.data["security"]["mobile_pin_hash"]),
     }
 
     try:
-        server = Server((args.host, args.port), make_handler(store, args.pin))
+        server = Server((args.host, args.port), make_handler(store))
         if args.tls_cert:
             tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             tls.load_cert_chain(args.tls_cert, args.tls_key)
@@ -1509,8 +1577,11 @@ def main():
     if store.info["lan_url"]:
         print(f"  Phone/tablet  : {store.info['lan_url']}   (same Wi-Fi)")
     print(f"  Data file     : {store.path}")
-    if store.info["lan_url"] and not args.pin:
-        print("\n  Note: anyone on your Wi-Fi can open this. Add  --pin 1234  to lock it. \n Support: Chandra: 9182395594")
+    if not store.info["account_email"]:
+        print("\n  On first open, create an account with your email and password.")
+    if store.info["lan_url"]:
+        print("  Mobile billing uses its own PIN. Only share the mobile URL/QR on a trusted Wi-Fi network.")
+    print("  Support: Chandra: 9182395594")
     print("\n  Press Ctrl+C to stop.\n")
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(local)).start()
@@ -1695,6 +1766,7 @@ button.mini{all:unset;box-sizing:border-box;display:flex;justify-content:space-b
 .settings-content{min-width:0}
 .settings-content>.settings-pane>.card{max-width:900px}
 .settings-pane[hidden]{display:none}
+#mobile-access-qr{max-width:100%;border:1px solid var(--line);background:#fff;padding:8px}
 
 /* dialog */
 dialog{border:0;border-radius:14px;padding:0;width:min(520px,94vw);max-height:92vh;box-shadow:0 24px 70px rgba(10,30,36,.4);color:var(--text);background:#fff}
@@ -1800,8 +1872,10 @@ dialog::backdrop{background:rgba(10,30,36,.55)}
 <section id="login-screen" class="login-screen" aria-labelledby="login-title">
   <form id="login-form" class="login-card stack">
     <div class="brand" style="color:var(--ink);padding:0">StockBill<small style="color:var(--muted)">Secure shop access</small></div>
-    <div><h1 id="login-title">Sign in</h1><p id="login-message" class="muted">Enter your shop PIN to continue.</p></div>
-    <label id="login-pin-wrap" class="f"><span>Shop PIN</span><input id="login-pin" type="password" name="pin" inputmode="numeric" autocomplete="current-password" required></label>
+    <div><h1 id="login-title">Sign in</h1><p id="login-message" class="muted">Sign in with your account email and password.</p></div>
+    <label class="f"><span>Email</span><input id="login-email" type="email" name="email" autocomplete="username" maxlength="254" required></label>
+    <label class="f"><span>Password</span><input id="login-password" type="password" name="password" autocomplete="current-password" minlength="8" maxlength="256" required></label>
+    <label id="login-confirm-wrap" class="f" hidden><span>Confirm password</span><input id="login-confirm-password" type="password" name="confirm_password" autocomplete="new-password" minlength="8" maxlength="256"></label>
     <p id="login-error" class="login-error" role="alert"></p>
     <button id="login-submit" class="btn">Sign in</button>
   </form>
@@ -1871,28 +1945,35 @@ const stockBadge = p => {
 const matches = (p, q) => !q || `${p.name} ${p.sku} ${p.category}`.toLowerCase().includes(q.toLowerCase());
 
 /* ---------- api ---------- */
-let sessionPin = '', loginEnabled = false, sessionActive = false;
+let sessionToken = '', accountConfigured = false, sessionActive = false;
 let upiQrUrl = '', upiQrRequest = 0;
+let mobileAccessQrUrl = '';
 try { localStorage.removeItem('sb_pin'); } catch (_) {}
-function showLogin(pinRequired, message = '') {
-  sessionPin = '';
+function showLogin(hasAccount, message = '') {
+  sessionToken = '';
   sessionActive = false;
   clearUpiQr();
+  clearMobileAccessQr();
+  accountConfigured = hasAccount;
+  $('#login-password').value = '';
+  $('#login-confirm-password').value = '';
   $('#app').hidden = true;
   $('#login-screen').hidden = false;
-  $('#login-pin-wrap').hidden = !pinRequired;
-  $('#login-pin').required = pinRequired;
-  $('#login-message').textContent = pinRequired
-    ? 'Enter the shop PIN.'
-    : 'PIN protection is not enabled on this server.';
-  $('#login-submit').textContent = pinRequired ? 'Sign in' : 'Continue';
+  $('#login-confirm-wrap').hidden = hasAccount;
+  $('#login-confirm-password').required = !hasAccount;
+  $('#login-password').autocomplete = hasAccount ? 'current-password' : 'new-password';
+  $('#login-title').textContent = hasAccount ? 'Sign in' : 'Create your account';
+  $('#login-message').textContent = hasAccount
+    ? 'Sign in with your account email and password.'
+    : 'Create the email and password you will use to sign in. Passwords need at least 8 characters.';
+  $('#login-submit').textContent = hasAccount ? 'Sign in' : 'Create account';
   $('#login-error').textContent = message;
-  if (pinRequired) $('#login-pin').focus();
+  $('#login-email').focus();
 }
 async function api(path, opts = {}) {
   const headers = {};
   if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
-  if (sessionPin) headers['X-Pin'] = sessionPin;
+  if (sessionToken) headers['X-Session-Token'] = sessionToken;
   let res;
   try {
     res = await fetch('/api' + path, {method: opts.method || 'GET', headers, body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined});
@@ -1908,7 +1989,7 @@ async function api(path, opts = {}) {
 function reportClientError(message, stack = '') {
   if (!sessionActive) return;
   const headers = {'Content-Type': 'application/json'};
-  if (sessionPin) headers['X-Pin'] = sessionPin;
+  if (sessionToken) headers['X-Session-Token'] = sessionToken;
   fetch('/api/client-errors', {
     method: 'POST', headers,
     body: JSON.stringify({message: String(message).slice(0, 500), stack: String(stack).slice(0, 1200)})
@@ -1924,7 +2005,7 @@ window.addEventListener('unhandledrejection', event => {
   reportClientError(reason && reason.message ? reason.message : String(reason), reason && reason.stack);
 });
 async function download(path, name) {
-  const headers = {}; if (sessionPin) headers['X-Pin'] = sessionPin;
+  const headers = {}; if (sessionToken) headers['X-Session-Token'] = sessionToken;
   const r = await fetch('/api' + path, {headers});
   if (r.status === 401) {
     showLogin(true, 'Your session expired. Sign in again.');
@@ -1940,6 +2021,37 @@ function clearUpiQr() {
   upiQrRequest++;
   if (upiQrUrl) URL.revokeObjectURL(upiQrUrl);
   upiQrUrl = '';
+}
+function clearMobileAccessQr() {
+  if (mobileAccessQrUrl) URL.revokeObjectURL(mobileAccessQrUrl);
+  mobileAccessQrUrl = '';
+}
+async function loadMobileAccessQr() {
+  const image = $('#mobile-access-qr'), message = $('#mobile-access-qr-error');
+  if (!image || !message) return;
+  message.textContent = 'Generating mobile access QR...';
+  image.hidden = true;
+  try {
+    const headers = {};
+    if (sessionToken) headers['X-Session-Token'] = sessionToken;
+    const response = await fetch('/api/mobile-access-qr', {headers});
+    if (response.status === 401) {
+      showLogin(true, 'Your session expired. Sign in again.');
+      return;
+    }
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      throw new Error(result.error || 'Could not generate the mobile access QR.');
+    }
+    const objectUrl = URL.createObjectURL(await response.blob());
+    clearMobileAccessQr();
+    mobileAccessQrUrl = objectUrl;
+    image.src = objectUrl;
+    image.hidden = false;
+    message.textContent = '';
+  } catch (error) {
+    message.textContent = `Could not generate the mobile access QR: ${error.message}`;
+  }
 }
 async function refreshUpiQr(amount) {
   const image = $('#upi-qr-image'), message = $('#upi-qr-message');
@@ -1967,7 +2079,7 @@ async function refreshUpiQr(amount) {
   message.textContent = 'Generating payment QR...';
   try {
     const headers = {};
-    if (sessionPin) headers['X-Pin'] = sessionPin;
+    if (sessionToken) headers['X-Session-Token'] = sessionToken;
     const response = await fetch(`/api/upi-qr?amount=${encodeURIComponent(amount.toFixed(2))}`, {headers});
     if (response.status === 401) {
       showLogin(true, 'Your session expired. Sign in again.');
@@ -2019,19 +2131,25 @@ $('#login-form').addEventListener('submit', async e => {
   const button = $('#login-submit');
   button.disabled = true;
   $('#login-error').textContent = '';
-  const candidate = loginEnabled ? $('#login-pin').value : '';
+  const email = $('#login-email').value.trim();
+  const password = $('#login-password').value;
+  const confirmPassword = $('#login-confirm-password').value;
   try {
     const response = await fetch('/api/login', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({pin: candidate})
+      body: JSON.stringify({
+        email, password,
+        ...(accountConfigured ? {} : {confirm_password: confirmPassword})
+      })
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok) {
       $('#login-error').textContent = result.error || 'Sign in failed.';
       return;
     }
-    sessionPin = candidate;
+    sessionToken = result.session_token;
+    accountConfigured = true;
     sessionActive = true;
     $('#login-screen').hidden = true;
     $('#app').hidden = false;
@@ -2170,9 +2288,7 @@ actions.logout = () => {
     toast(`Could not record sign out: ${err.message}`, 'err');
   }).finally(() => {
   closeModal();
-  sessionPin = '';
-  $('#login-pin').value = '';
-  showLogin(loginEnabled);
+  showLogin(true);
   });
 };
 actions['new-bill'] = () => {
@@ -2195,6 +2311,7 @@ async function render() {
     const html = await fn();
     if (token !== renderToken) return;
     $('#main').innerHTML = financialYearControl() + html;
+    if (S.view === 'settings' && S.settingsSection === 'mobile') loadMobileAccessQr();
     if (S.view === 'billing') { renderPosList(); renderBill(); }
     if (S.view === 'invoices') refreshInvoiceList();
     if (S.focusPos && S.view === 'billing') { S.focusPos = false; $('#pos-q').focus(); }
@@ -2668,9 +2785,10 @@ async function vSettings() {
   const sections = [
     ['shop', 'Shop details'],
     ['billing', 'Billing & tax'],
-    ['security', 'Security'],
+    ['security', 'Account & security'],
     ['mobile', 'Mobile access'],
-    ['data', 'Data & integrations']
+    ['data', 'Data & integrations'],
+    ['help', 'Help & support']
   ];
   return `<header class="page-head"><h1>Settings</h1></header>
     <div class="settings-layout">
@@ -2699,18 +2817,19 @@ async function vSettings() {
       <button class="btn">Save billing settings</button></form>
     </section>
     <section class="settings-pane stack" data-settings-pane="security" ${S.settingsSection !== 'security' ? 'hidden' : ''}>
-    <div class="card stack"><h2>Change PIN</h2>
-      <p class="muted">${i.pin_enabled ? 'Enter your current PIN and choose a new one.' : 'Set a PIN to require sign-in each time the app opens.'} Use 4 to 12 digits.</p>
-      <form class="stack" data-form="pin">
-        ${i.pin_enabled ? field('Current PIN', 'current_pin', '', 'type="password" inputmode="numeric" autocomplete="current-password" required') : '<input type="hidden" name="current_pin" value="">'}
-        ${field('New PIN', 'new_pin', '', 'type="password" inputmode="numeric" autocomplete="new-password" minlength="4" maxlength="12" pattern="[0-9]{4,12}" required')}
-        ${field('Confirm new PIN', 'confirm_pin', '', 'type="password" inputmode="numeric" autocomplete="new-password" minlength="4" maxlength="12" pattern="[0-9]{4,12}" required')}
-        <button class="btn">Save PIN</button>
+    <div class="card stack"><h2>Account sign-in</h2>
+      <p class="muted">Desktop sign-in uses an email and password. Passwords must be 8 to 256 characters. Leave the new password fields empty to change only your email.</p>
+      <form class="stack" data-form="account">
+        ${field('Account email', 'email', i.account_email || '', 'type="email" maxlength="254" autocomplete="username" required')}
+        ${field('Current password', 'current_password', '', 'type="password" autocomplete="current-password" required')}
+        ${field('New password (optional)', 'new_password', '', 'type="password" minlength="8" maxlength="256" autocomplete="new-password"')}
+        ${field('Confirm new password', 'confirm_password', '', 'type="password" minlength="8" maxlength="256" autocomplete="new-password"')}
+        <button class="btn">Save account</button>
       </form></div>
     </section>
     <section class="settings-pane stack" data-settings-pane="mobile" ${S.settingsSection !== 'mobile' ? 'hidden' : ''}>
     <div class="card stack"><h2>Mobile billing access</h2>
-      <p class="muted">${i.mobile_pin_enabled ? 'Mobile billing is protected by its own PIN.' : 'Set a separate PIN to enable the billing-only mobile page.'} Use 4 to 12 digits, different from the shop PIN.</p>
+      <p class="muted">${i.mobile_pin_enabled ? 'Mobile billing is protected by its own PIN.' : 'Set a PIN to enable the billing-only mobile page.'} Use 4 to 12 digits.</p>
       <form class="stack" data-form="mobile-pin">
         ${field(i.mobile_pin_enabled ? 'New mobile PIN' : 'Mobile PIN', 'new_pin', '', 'type="password" inputmode="numeric" autocomplete="new-password" minlength="4" maxlength="12" pattern="[0-9]{4,12}" required')}
         ${field('Confirm mobile PIN', 'confirm_pin', '', 'type="password" inputmode="numeric" autocomplete="new-password" minlength="4" maxlength="12" pattern="[0-9]{4,12}" required')}
@@ -2718,10 +2837,11 @@ async function vSettings() {
       </form>
       ${i.mobile_pin_enabled ? '<button class="btn danger" data-act="disable-mobile-billing">Disable mobile billing</button>' : ''}
       ${i.lan_url ? `<p>On the same Wi-Fi, open <b style="overflow-wrap:anywhere">${esc(i.lan_url)}/mobile</b> on the phone.</p>` : '<p class="muted">Start StockBill on your Wi-Fi interface to access the mobile page from another device.</p>'}
-      <p class="muted">This page only supports billing; its PIN cannot access the main app APIs. Use only on a trusted private Wi-Fi network: HTTP does not encrypt the PIN or transaction data. Camera scanning requires HTTPS, so on this HTTP page use search, type a SKU/barcode, or connect a keyboard-style scanner.</p></div>
+      ${i.lan_url ? '<div class="stack"><b>Scan to open mobile billing</b><img id="mobile-access-qr" alt="QR code for the StockBill mobile access URL" width="220" height="220" hidden><p id="mobile-access-qr-error" class="muted" role="status"></p></div>' : ''}
+      <p class="muted">This page only supports billing; its PIN cannot access the main app APIs. Use only on a trusted private Wi-Fi network: HTTP does not encrypt the PIN, account credentials, or transaction data. Camera scanning requires HTTPS, so on this HTTP page use search, type a SKU/barcode, or connect a keyboard-style scanner.</p></div>
     <div class="card stack"><h2>Use on your phone</h2>
       ${i.lan_url ? `<p>On the same Wi-Fi, open <b style="overflow-wrap:anywhere">${esc(i.lan_url)}</b> in your phone's browser, then use "Add to Home screen".</p>` : '<p class="muted">The server was started for this computer only. Restart without <code>--host 127.0.0.1</code> to use it on a phone.</p>'}
-      <p class="muted">${i.pin_enabled ? 'A PIN is required to open the app. PIN changes are saved and will remain active after restart.' : 'No PIN is set. Anyone on your Wi-Fi can open this. Set one above to lock the app.'}</p></div>
+      <p class="muted">The desktop app requires your account email and password. The mobile billing page accepts only its separate mobile PIN.</p></div>
     </section>
     <section class="settings-pane stack" data-settings-pane="data" ${S.settingsSection !== 'data' ? 'hidden' : ''}>
     <div class="card stack"><h2>Your data</h2>
@@ -2731,6 +2851,15 @@ async function vSettings() {
     <div class="card stack"><h2>WhatsApp Web</h2>
       <p class="muted">Link this browser using WhatsApp's official QR code. Open WhatsApp Web, scan the QR code with WhatsApp on your phone, then use the reminder links on customer and invoice bills. Messages open as drafts for you to review and send.</p>
       <p><a class="btn ghost" href="https://web.whatsapp.com/" target="_blank" rel="noopener noreferrer">Open WhatsApp Web to scan QR</a></p></div>
+    </section>
+    <section class="settings-pane stack" data-settings-pane="help" ${S.settingsSection !== 'help' ? 'hidden' : ''}>
+    <div class="card stack"><h2>Help</h2>
+      <h3>Desktop sign-in</h3><p class="muted">Use the email and password created the first time StockBill was opened. Update them in Account &amp; security. There is no in-app password reset, so keep your credentials safe and make regular data backups.</p>
+      <h3>Mobile billing</h3><p class="muted">Connect the phone to the same Wi-Fi as this computer, scan the QR code in Mobile access, then sign in with the mobile PIN. The phone page is limited to creating bills and cannot open shop settings or reports.</p>
+      <h3>Connection and scanning</h3><p class="muted">Keep StockBill running while using another device. If the QR link does not connect, confirm both devices are on the same trusted Wi-Fi and that the computer firewall allows StockBill's port. HTTP does not encrypt passwords, PINs, or business data; use HTTPS on networks you do not trust. Camera scanning requires HTTPS and a supported browser; SKU search and keyboard-style scanners also work without camera access.</p></div>
+    <div class="card stack"><h2>Support</h2>
+      <p class="muted">Contact Chandra for StockBill support.</p>
+      <p><a class="btn ghost" href="tel:+9182395594">Call 9182395594</a> <a class="btn ghost" href="https://wa.me/9182395594" target="_blank" rel="noopener noreferrer">Message on WhatsApp</a></p></div>
     </section>
       </div>
     </div>`;
@@ -2746,6 +2875,7 @@ actions['settings-section'] = el => {
   $$('.settings-pane').forEach(pane => {
     pane.hidden = pane.dataset.settingsPane !== S.settingsSection;
   });
+  if (S.settingsSection === 'mobile') loadMobileAccessQr();
 };
 forms.settings = async f => {
   const fd = new FormData(f), d = Object.fromEntries(fd);
@@ -2754,14 +2884,22 @@ forms.settings = async f => {
   S.settings = await api('/settings', {method: 'PUT', body: d});
   document.title = S.settings.business_name + ' | StockBill'; renderNav(); toast('Settings saved', 'ok');
 };
-forms.pin = async f => {
+forms.account = async f => {
   const data = Object.fromEntries(new FormData(f));
-  if (data.new_pin !== data.confirm_pin) throw new Error('New PIN and confirmation do not match');
-  delete data.confirm_pin;
-  await api('/pin', {method: 'POST', body: data});
-  sessionPin = data.new_pin;
-  S.info.pin_enabled = true;
-  toast('PIN saved', 'ok');
+  if (!!data.new_password !== !!data.confirm_password) {
+    throw new Error('Enter and confirm the new password');
+  }
+  if (data.new_password && data.new_password !== data.confirm_password) {
+    throw new Error('New password and confirmation do not match');
+  }
+  if (!data.new_password) {
+    delete data.new_password;
+    delete data.confirm_password;
+  }
+  const result = await api('/account', {method: 'POST', body: data});
+  S.info.account_email = result.account_email;
+  sessionToken = result.session_token;
+  toast('Account updated', 'ok');
   render();
 };
 forms['mobile-pin'] = async f => {
@@ -2886,8 +3024,8 @@ async function startApp() {
     const response = await fetch('/api/login');
     if (!response.ok) throw new Error('Could not check login settings.');
     const info = await response.json();
-    loginEnabled = !!info.pin_enabled;
-    showLogin(loginEnabled);
+    accountConfigured = !!info.account_configured;
+    showLogin(accountConfigured);
   } catch (err) {
     showLogin(false, err.message || "Can't reach the server.");
   }
