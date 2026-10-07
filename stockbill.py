@@ -2839,9 +2839,6 @@ async function vSettings() {
       ${i.lan_url ? `<p>On the same Wi-Fi, open <b style="overflow-wrap:anywhere">${esc(i.lan_url)}/mobile</b> on the phone.</p>` : '<p class="muted">Start StockBill on your Wi-Fi interface to access the mobile page from another device.</p>'}
       ${i.lan_url ? '<div class="stack"><b>Scan to open mobile billing</b><img id="mobile-access-qr" alt="QR code for the StockBill mobile access URL" width="220" height="220" hidden><p id="mobile-access-qr-error" class="muted" role="status"></p></div>' : ''}
       <p class="muted">This page only supports billing; its PIN cannot access the main app APIs. Use only on a trusted private Wi-Fi network: HTTP does not encrypt the PIN, account credentials, or transaction data. Camera scanning requires HTTPS, so on this HTTP page use search, type a SKU/barcode, or connect a keyboard-style scanner.</p></div>
-    <div class="card stack"><h2>Use on your phone</h2>
-      ${i.lan_url ? `<p>On the same Wi-Fi, open <b style="overflow-wrap:anywhere">${esc(i.lan_url)}</b> in your phone's browser, then use "Add to Home screen".</p>` : '<p class="muted">The server was started for this computer only. Restart without <code>--host 127.0.0.1</code> to use it on a phone.</p>'}
-      <p class="muted">The desktop app requires your account email and password. The mobile billing page accepts only its separate mobile PIN.</p></div>
     </section>
     <section class="settings-pane stack" data-settings-pane="data" ${S.settingsSection !== 'data' ? 'hidden' : ''}>
     <div class="card stack"><h2>Your data</h2>
