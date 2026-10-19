@@ -3,3 +3,6 @@
 stockbill.log*
 __pycache__/
 backups/
+.venv/
+build/
+dist/

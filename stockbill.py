@@ -54,6 +54,16 @@ PAY_METHODS = ("Cash", "UPI", "Card", "Bank", "Other")
 ACTIVITY_LOG_MAX_BYTES = 2_000_000
 ACTIVITY_LOG_BACKUPS = 5
 
+
+def application_data_dir():
+    if getattr(sys, "frozen", False):
+        root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        path = os.path.join(root, APP_NAME)
+        os.makedirs(path, exist_ok=True)
+        return path
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 DEFAULT_SETTINGS = {
     "business_name": "My Shop",
     "address": "",
@@ -221,7 +231,7 @@ def month_anniversary(day, months):
 class Store:
     def __init__(self, path):
         self.path = os.path.abspath(path)
-        self.log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stockbill.log")
+        self.log_path = os.path.join(application_data_dir(), "stockbill.log")
         self.lock = threading.RLock()
         self.info = {}
         self.data = self._load()
@@ -1532,9 +1542,8 @@ def lan_ip():
 
 
 def main():
-    here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description=f"{APP_NAME}: inventory and billing (JSON file storage)")
-    ap.add_argument("--data", default=os.path.join(here, "stockbill_data.json"), help="path of the JSON data file")
+    ap.add_argument("--data", default=os.path.join(application_data_dir(), "stockbill_data.json"), help="path of the JSON data file")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0", help="0.0.0.0 = reachable from phones on your Wi-Fi; 127.0.0.1 = this computer only")
     ap.add_argument("--demo", action="store_true", help="add sample items and customers if the data file is empty")
